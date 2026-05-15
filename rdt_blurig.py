@@ -75,8 +75,10 @@ print(f"Device: {DEVICE}  dtype: {DTYPE}")
 # valid, but the attribution will be task-agnostic.
 if os.path.exists(LANG_PT):
     ld = torch.load(LANG_PT, map_location="cpu")
-    lang_tokens    = ld["embeddings"].to(DEVICE, dtype=DTYPE)          # (1, L, 4096)
-    lang_attn_mask = torch.ones(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE)
+    lang_tokens    = ld["embeddings"].to(DEVICE, dtype=DTYPE)           # (1, L, 4096)
+    # attention_mask saved alongside embeddings; fall back to all-ones if absent
+    lang_attn_mask = ld.get("attention_mask",
+                            torch.ones(lang_tokens.shape[:2])).bool().to(DEVICE)
     print(f"Language embedding: {lang_tokens.shape}")
 else:
     print(f"[warn] {LANG_PT} not found — using zero embedding (task-agnostic).")
