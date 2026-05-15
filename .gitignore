@@ -1,0 +1,29 @@
+# Downloaded media
+*.webm
+*.mp4
+*.avi
+
+# Output images
+*_output.png
+*_decomp.png
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# HuggingFace / torch cache
+.cache/
+*.pt
+*.bin
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

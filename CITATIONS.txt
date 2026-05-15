@@ -1,0 +1,97 @@
+Attribution Method
+==================
+
+Blur Integrated Gradients (BlurIG)
+-----------------------------------
+Xu, S., Venugopalan, S., & Sundararajan, M. (2020).
+Attribution in Scale and Space.
+In Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR), pp. 9744-9753.
+
+URL: https://openaccess.thecvf.com/content_CVPR_2020/papers/Xu_Attribution_in_Scale_and_Space_CVPR_2020_paper.pdf
+
+What it does:
+  Standard Integrated Gradients requires a user-chosen baseline (e.g. a
+  black image). That baseline is out-of-distribution for models like CLIP
+  that have never seen a pure-black input, introducing artifacts in the
+  integration path.
+
+  BlurIG replaces the straight-line path from baseline to input with a
+  progressive-deblur path:
+
+      x(t) = GaussianBlur(x, sigma(t))
+      sigma(t) = sigma_max * (1 - t),  t in [0, 1]
+
+  At t=0 the "baseline" is the maximally blurred image (near-uniform,
+  in-distribution). At t=1 it is the original input. Every interpolation
+  step remains in natural-image space. The method satisfies the same
+  axiomatic properties as standard IG (completeness, sensitivity,
+  implementation invariance) while producing cleaner, less noisy maps.
+
+BibTeX
+------
+@InProceedings{Xu_2020_CVPR,
+    author    = {Xu, Shawn and Venugopalan, Subhashini and Sundararajan, Mukund},
+    title     = {Attribution in Scale and Space},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision
+                 and Pattern Recognition (CVPR)},
+    year      = {2020},
+    pages     = {9744--9753}
+}
+
+
+Related / Foundational Work
+============================
+
+Original Integrated Gradients
+------------------------------
+Sundararajan, M., Taly, A., & Yan, Q. (2017).
+Axiomatic Attribution for Deep Networks.
+In Proceedings of the 34th International Conference on Machine Learning
+(ICML), PMLR 70, pp. 3319-3328.
+
+URL: https://arxiv.org/abs/1703.01365
+
+BibTeX
+------
+@InProceedings{sundararajan17axiomatic,
+    author    = {Sundararajan, Mukund and Taly, Ankur and Yan, Qiqi},
+    title     = {Axiomatic Attribution for Deep Networks},
+    booktitle = {Proceedings of the 34th International Conference on
+                 Machine Learning},
+    year      = {2017},
+    volume    = {70},
+    pages     = {3319--3328},
+    publisher = {PMLR}
+}
+
+
+Model Used
+==========
+
+CLIP (Contrastive Language-Image Pre-Training)
+----------------------------------------------
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S.,
+Sastry, G., Askell, A., Mishkin, P., Clark, J., Krueger, G., & Sutskever, I.
+(2021). Learning Transferable Visual Models From Natural Language Supervision.
+In Proceedings of the 38th International Conference on Machine Learning
+(ICML), PMLR 139, pp. 8748-8763.
+
+URL: https://arxiv.org/abs/2103.00020
+
+BibTeX
+------
+@InProceedings{radford2021clip,
+    author    = {Radford, Alec and Kim, Jong Wook and Hallacy, Chris and
+                 Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and
+                 Sastry, Girish and Askell, Amanda and Mishkin, Pamela and
+                 Clark, Jack and Krueger, Gretchen and Sutskever, Ilya},
+    title     = {Learning Transferable Visual Models From Natural Language
+                 Supervision},
+    booktitle = {Proceedings of the 38th International Conference on
+                 Machine Learning},
+    year      = {2021},
+    volume    = {139},
+    pages     = {8748--8763},
+    publisher = {PMLR}
+}
