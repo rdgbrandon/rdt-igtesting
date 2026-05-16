@@ -93,6 +93,13 @@ for _pkg in ("wandb", "deepspeed", "flash_attn"):
 from models.rdt_runner import RDTRunner
 from configs.state_vec import STATE_VEC_IDX_MAPPING
 
+# huggingface_hub >= 0.24 no longer passes `proxies`/`resume_download` to
+# _from_pretrained, but RDT's CompatiblePyTorchModelHubMixin requires them.
+_orig_fp = RDTRunner._from_pretrained.__func__
+def _fp_compat(cls, *a, proxies=None, resume_download=False, **kw):
+    return _orig_fp(cls, *a, proxies=proxies, resume_download=resume_download, **kw)
+RDTRunner._from_pretrained = classmethod(_fp_compat)
+
 print(f"Device: {DEVICE}  dtype: {DTYPE}")
 
 # ── ManiSkill indices in the 128-dim unified state vector ─────────────────────
