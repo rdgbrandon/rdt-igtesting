@@ -168,7 +168,7 @@ if not os.path.exists(LANG_PT):
         f"{LANG_PT} not found.\n"
         "Run Cell 2 to download the pre-encoded language embedding from HuggingFace."
     )
-ld             = torch.load(LANG_PT, map_location="cpu")
+ld             = torch.load(LANG_PT, map_location="cpu", weights_only=False)
 lang_tokens    = ld["embeddings"].to(DEVICE, dtype=DTYPE)            # (1, L, 4096)
 lang_attn_mask = ld.get("attention_mask",
                          torch.ones(lang_tokens.shape[:2])).bool().to(DEVICE)
@@ -195,6 +195,8 @@ rdt.to(DEVICE, dtype=DTYPE).eval()
 for p in rdt.parameters():
     p.requires_grad_(False)
 rdt.num_inference_timesteps = N_DDPM_STEPS
+if hasattr(rdt, "noise_scheduler"):
+    rdt.noise_scheduler.set_timesteps(N_DDPM_STEPS)
 
 ACTION_DIM  = rdt.action_dim    # 128
 PRED_HORIZ  = rdt.pred_horizon  # 64
@@ -240,11 +242,12 @@ def rdt_score(E_t):
     Score = norm of predicted gripper commands over the first SCORE_HORIZON steps.
     Gradient flows: E_t → img_adaptor → img_cond → denoising loop → actions.
     """
-    img_cond = rdt.img_adaptor(E_t.repeat(1, 6, 1))    # (1, 4374, hidden)
-    actions  = rdt.conditional_sample(
-        lang_cond, lang_attn_mask, img_cond,
-        state_traj, action_mask, ctrl_freqs,
-    )  # (1, 64, 128)
+    with torch.enable_grad():
+        img_cond = rdt.img_adaptor(E_t.repeat(1, 6, 1))    # (1, 4374, hidden)
+        actions  = rdt.conditional_sample(
+            lang_cond, lang_attn_mask, img_cond,
+            state_traj, action_mask, ctrl_freqs,
+        )  # (1, 64, 128)
     # MANISKILL_INDICES[6] = gripper_open (index 10 in state vec)
     gripper_idx = MANISKILL_INDICES[7]
     return actions[:, :SCORE_HORIZON, gripper_idx].norm()
@@ -270,8 +273,9 @@ def to_map(attr, h, w):
     a    = attr.squeeze(0).float().cpu().detach().numpy()
     grid = np.abs(a).sum(-1).reshape(grid_size, grid_size)
     grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+    _bilinear = getattr(PILImage, "Resampling", PILImage).BILINEAR
     return np.array(
-        PILImage.fromarray((grid * 255).astype(np.uint8)).resize((w, h), PILImage.BILINEAR)
+        PILImage.fromarray((grid * 255).astype(np.uint8)).resize((w, h), _bilinear)
     ) / 255.0
 
 # ── Run ───────────────────────────────────────────────────────────────────────
