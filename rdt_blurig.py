@@ -53,6 +53,12 @@ import huggingface_hub as _hfhub
 if not hasattr(_hfhub, "cached_download"):
     _hfhub.cached_download = _hfhub.hf_hub_download
 
+# wandb is only needed for training/logging. Mock it out so its protobuf stubs
+# (which break when protobuf is upgraded to 5.x) are never loaded.
+import sys
+from unittest.mock import MagicMock
+sys.modules.setdefault("wandb", MagicMock())
+
 from models.rdt_runner import RDTRunner
 from configs.state_vec import STATE_VEC_IDX_MAPPING
 
