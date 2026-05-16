@@ -168,10 +168,19 @@ if not os.path.exists(LANG_PT):
         f"{LANG_PT} not found.\n"
         "Run Cell 2 to download the pre-encoded language embedding from HuggingFace."
     )
-ld             = torch.load(LANG_PT, map_location="cpu", weights_only=False)
-lang_tokens    = ld["embeddings"].to(DEVICE, dtype=DTYPE)            # (1, L, 4096)
-lang_attn_mask = ld.get("attention_mask",
-                         torch.ones(lang_tokens.shape[:2])).bool().to(DEVICE)
+ld = torch.load(LANG_PT, map_location="cpu", weights_only=False)
+if isinstance(ld, dict):
+    lang_tokens    = ld["embeddings"]
+    lang_attn_mask = ld.get("attention_mask", None)
+else:
+    lang_tokens    = ld          # file contains the tensor directly
+    lang_attn_mask = None
+if lang_tokens.dim() == 2:
+    lang_tokens = lang_tokens.unsqueeze(0)   # (1, L, 4096)
+lang_tokens    = lang_tokens.to(DEVICE, dtype=DTYPE)
+lang_attn_mask = (lang_attn_mask.bool().to(DEVICE)
+                  if lang_attn_mask is not None
+                  else torch.ones(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE))
 print(f"Language embedding: {lang_tokens.shape}")
 
 # ── Vision encoder ────────────────────────────────────────────────────────────
