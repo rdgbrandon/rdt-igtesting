@@ -46,6 +46,13 @@ if not os.path.exists(RDT_REPO):
         "  git clone https://github.com/thu-ml/RoboticsDiffusionTransformer"
     )
 sys.path.insert(0, os.path.abspath(RDT_REPO))
+
+# huggingface_hub removed cached_download in v0.23 but older diffusers still
+# import it. Patch it in before importing diffusers/RDT so the import succeeds.
+import huggingface_hub as _hfhub
+if not hasattr(_hfhub, "cached_download"):
+    _hfhub.cached_download = _hfhub.hf_hub_download
+
 from models.rdt_runner import RDTRunner
 from configs.state_vec import STATE_VEC_IDX_MAPPING
 
