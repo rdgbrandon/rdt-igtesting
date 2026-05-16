@@ -59,23 +59,29 @@ if not hasattr(_hfhub, "cached_download"):
 
 # wandb and deepspeed are training-only. Stub them out before RDT imports so
 # their broken protobuf stubs / missing CUDA extensions are never loaded.
-# We use types.ModuleType (not MagicMock) so importlib.__spec__ checks pass.
-import sys, types
+import sys, types, importlib.machinery
 
 def _make_stub(name):
     class _Stub(types.ModuleType):
         def __getattr__(self, n):
+            # Let dunder attrs fall through to AttributeError — returning a _Stub
+            # for __file__, __path__, etc. breaks os.path and importlib checks.
+            if n.startswith("__") and n.endswith("__"):
+                raise AttributeError(n)
             child = _make_stub(f"{self.__name__}.{n}")
             object.__setattr__(self, n, child)
             sys.modules[child.__name__] = child
             return child
         def __call__(self, *a, **kw):
-            return _make_stub(f"{self.__name__}._call")
+            return None
         def __repr__(self):
             return f"<stub '{self.__name__}'>"
+
     m = _Stub(name)
-    m.__spec__    = None
+    # Python 3.12 find_spec raises ValueError if __spec__ is None — use a real ModuleSpec.
+    m.__spec__    = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
     m.__path__    = []
+    m.__file__    = ""   # empty string; os.path.splitext("") works fine
     m.__package__ = name.split(".")[0]
     return m
 
