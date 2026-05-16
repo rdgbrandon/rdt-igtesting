@@ -28,7 +28,7 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE    = torch.float16 if DEVICE == "cuda" else torch.float32
+DTYPE    = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 RDT_REPO  = os.environ.get("RDT_REPO", "../RoboticsDiffusionTransformer")
 RDT_HF_ID = "robotics-diffusion-transformer/rdt-1b"
