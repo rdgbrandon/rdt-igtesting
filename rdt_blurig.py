@@ -95,10 +95,13 @@ from configs.state_vec import STATE_VEC_IDX_MAPPING
 
 # huggingface_hub >= 0.24 no longer passes `proxies`/`resume_download` to
 # _from_pretrained, but RDT's CompatiblePyTorchModelHubMixin requires them.
-_orig_fp = RDTRunner._from_pretrained.__func__
-def _fp_compat(cls, *a, proxies=None, resume_download=False, **kw):
-    return _orig_fp(cls, *a, proxies=proxies, resume_download=resume_download, **kw)
-RDTRunner._from_pretrained = classmethod(_fp_compat)
+# Guard prevents recursion when %run re-uses cached module objects.
+if not getattr(RDTRunner, '_fp_patched', False):
+    _orig_fp = RDTRunner._from_pretrained.__func__
+    def _fp_compat(cls, *a, proxies=None, resume_download=False, **kw):
+        return _orig_fp(cls, *a, proxies=proxies, resume_download=resume_download, **kw)
+    RDTRunner._from_pretrained = classmethod(_fp_compat)
+    RDTRunner._fp_patched = True
 
 print(f"Device: {DEVICE}  dtype: {DTYPE}")
 
