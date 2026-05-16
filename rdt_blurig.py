@@ -90,18 +90,23 @@ for _pkg in ("wandb", "deepspeed", "flash_attn"):
         del sys.modules[_k]
     sys.modules[_pkg] = _make_stub(_pkg)
 
+# Clear RDT module cache so %run always gets a fresh, unpatched class.
+# Without this, the second %run captures the already-patched _from_pretrained
+# as _orig_fp and recurses infinitely.
+for _k in list(sys.modules):
+    if _k == "models" or _k.startswith("models.") or \
+       _k == "configs" or _k.startswith("configs."):
+        del sys.modules[_k]
+
 from models.rdt_runner import RDTRunner
 from configs.state_vec import STATE_VEC_IDX_MAPPING
 
 # huggingface_hub >= 0.24 no longer passes `proxies`/`resume_download` to
 # _from_pretrained, but RDT's CompatiblePyTorchModelHubMixin requires them.
-# Guard prevents recursion when %run re-uses cached module objects.
-if not getattr(RDTRunner, '_fp_patched', False):
-    _orig_fp = RDTRunner._from_pretrained.__func__
-    def _fp_compat(cls, *a, proxies=None, resume_download=False, **kw):
-        return _orig_fp(cls, *a, proxies=proxies, resume_download=resume_download, **kw)
-    RDTRunner._from_pretrained = classmethod(_fp_compat)
-    RDTRunner._fp_patched = True
+_orig_fp = RDTRunner._from_pretrained.__func__
+def _fp_compat(cls, *a, proxies=None, resume_download=False, **kw):
+    return _orig_fp(cls, *a, proxies=proxies, resume_download=resume_download, **kw)
+RDTRunner._from_pretrained = classmethod(_fp_compat)
 
 print(f"Device: {DEVICE}  dtype: {DTYPE}")
 
