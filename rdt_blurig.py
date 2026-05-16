@@ -14,6 +14,10 @@
 #   Cell 3: run this script
 
 import os, sys
+os.environ.setdefault("DISPLAY", "")           # headless rendering for ManiSkill
+os.environ.setdefault("MUJOCO_GL", "egl")      # force EGL backend (no X server needed)
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
 import torch
 import numpy as np
 import torchvision.transforms.functional as TF
@@ -53,11 +57,32 @@ import huggingface_hub as _hfhub
 if not hasattr(_hfhub, "cached_download"):
     _hfhub.cached_download = _hfhub.hf_hub_download
 
-# wandb is only needed for training/logging. Mock it out so its protobuf stubs
-# (which break when protobuf is upgraded to 5.x) are never loaded.
-import sys
-from unittest.mock import MagicMock
-sys.modules.setdefault("wandb", MagicMock())
+# wandb and deepspeed are training-only. Stub them out before RDT imports so
+# their broken protobuf stubs / missing CUDA extensions are never loaded.
+# We use types.ModuleType (not MagicMock) so importlib.__spec__ checks pass.
+import sys, types
+
+def _make_stub(name):
+    class _Stub(types.ModuleType):
+        def __getattr__(self, n):
+            child = _make_stub(f"{self.__name__}.{n}")
+            object.__setattr__(self, n, child)
+            sys.modules[child.__name__] = child
+            return child
+        def __call__(self, *a, **kw):
+            return _make_stub(f"{self.__name__}._call")
+        def __repr__(self):
+            return f"<stub '{self.__name__}'>"
+    m = _Stub(name)
+    m.__spec__    = None
+    m.__path__    = []
+    m.__package__ = name.split(".")[0]
+    return m
+
+for _pkg in ("wandb", "deepspeed", "flash_attn"):
+    for _k in [k for k in sys.modules if k == _pkg or k.startswith(_pkg + ".")]:
+        del sys.modules[_k]
+    sys.modules[_pkg] = _make_stub(_pkg)
 
 from models.rdt_runner import RDTRunner
 from configs.state_vec import STATE_VEC_IDX_MAPPING
