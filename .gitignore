@@ -6,6 +6,8 @@
 # Output images
 *_output.png
 *_decomp.png
+*_null_comparison.png
+robot_frame.jpg
 
 # Python cache
 __pycache__/
