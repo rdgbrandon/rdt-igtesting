@@ -53,7 +53,7 @@ _TASK_DESCRIPTIONS = {
 TASK_TEXT        = _TASK_LABELS.get(TASK, TASK)
 TASK_DESCRIPTION = _TASK_DESCRIPTIONS.get(TASK, TASK_TEXT)
 
-N_DDPM_STEPS   = 5
+N_DDPM_STEPS   = 10
 N_BLURIG_STEPS = 20
 SIGMA_MAX      = 2.0
 SCORE_HORIZON  = 8   # first N action steps used for gripper score
