@@ -57,6 +57,7 @@ N_DDPM_STEPS   = 5
 N_BLURIG_STEPS = 20
 SIGMA_MAX      = 2.0
 SCORE_HORIZON  = 8   # first N action steps used for gripper score
+SKIP_IG        = os.environ.get("SKIP_IG", "0") == "1"
 
 # ── RDT on sys.path ───────────────────────────────────────────────────────────
 if not os.path.exists(RDT_REPO):
@@ -317,30 +318,31 @@ def to_map(attr, h, w):
     ) / 255.0
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-print(f"\nFeature-level BlurIG")
-print(f"  Task:          {TASK}  ({TASK_TEXT})")
-print(f"  BlurIG steps:  {N_BLURIG_STEPS}")
-print(f"  DDPM steps:    {N_DDPM_STEPS} per BlurIG step")
-print(f"  Score:         gripper (state vec idx {MANISKILL_INDICES[7]}) over {SCORE_HORIZON} steps\n")
+if SKIP_IG:
+    print("Models loaded. SKIP_IG=1 — skipping BlurIG. Ready.")
+else:
+    print(f"\nFeature-level BlurIG")
+    print(f"  Task:          {TASK}  ({TASK_TEXT})")
+    print(f"  BlurIG steps:  {N_BLURIG_STEPS}")
+    print(f"  DDPM steps:    {N_DDPM_STEPS} per BlurIG step")
+    print(f"  Score:         gripper over {SCORE_HORIZON} steps\n")
 
-attr   = feature_blur_ig(single_emb)
-img_np = np.array(frame_pil) / 255.0
-amap   = to_map(attr, frame_pil.height, frame_pil.width)
+    attr   = feature_blur_ig(single_emb)
+    img_np = np.array(frame_pil) / 255.0
+    amap   = to_map(attr, frame_pil.height, frame_pil.width)
 
-# ── Visualise ─────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
-axes[0].imshow(img_np);                                                                    axes[0].set_title("ManiSkill frame", fontsize=11)
-axes[1].imshow(img_np); axes[1].imshow(amap, cmap="inferno", alpha=0.6, vmin=0, vmax=1); axes[1].set_title("BlurIG overlay", fontsize=11)
-axes[2].imshow(amap, cmap="inferno", vmin=0, vmax=1);                                     axes[2].set_title("BlurIG — gripper attribution", fontsize=11)
-for ax in axes: ax.axis("off")
-
-fig.suptitle(
-    f"RDT-1B  —  feature-level BlurIG  |  Task: {TASK} ({TASK_TEXT})\n"
-    f"Score: gripper command over first {SCORE_HORIZON} steps  |  "
-    f"Patch grid: {grid_size}x{grid_size}  |  "
-    f"BlurIG steps: {N_BLURIG_STEPS}  DDPM steps: {N_DDPM_STEPS}",
-    fontsize=9,
-)
-plt.tight_layout()
-plt.savefig("rdt_blurig_output.png", dpi=150, bbox_inches="tight")
-print("\nSaved: rdt_blurig_output.png")
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+    axes[0].imshow(img_np);                                                                    axes[0].set_title("ManiSkill frame", fontsize=11)
+    axes[1].imshow(img_np); axes[1].imshow(amap, cmap="inferno", alpha=0.6, vmin=0, vmax=1); axes[1].set_title("BlurIG overlay", fontsize=11)
+    axes[2].imshow(amap, cmap="inferno", vmin=0, vmax=1);                                     axes[2].set_title("BlurIG — gripper attribution", fontsize=11)
+    for ax in axes: ax.axis("off")
+    fig.suptitle(
+        f"RDT-1B  —  feature-level BlurIG  |  Task: {TASK} ({TASK_TEXT})\n"
+        f"Score: gripper over first {SCORE_HORIZON} steps  |  "
+        f"Patch grid: {grid_size}x{grid_size}  |  "
+        f"BlurIG steps: {N_BLURIG_STEPS}  DDPM steps: {N_DDPM_STEPS}",
+        fontsize=9,
+    )
+    plt.tight_layout()
+    plt.savefig("rdt_blurig_output.png", dpi=150, bbox_inches="tight")
+    print("\nSaved: rdt_blurig_output.png")
