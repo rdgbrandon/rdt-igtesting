@@ -236,7 +236,7 @@ def make_env_with_wrist(task_id, **kwargs):
                         _cfg = _CC(uid="wrist_camera", pose=_lp,
                                    width=384, height=384, fov=1.57,
                                    near=0.01, far=100, mount=_hand)
-                        _cam = _Cam(_cfg, self._scene)
+                        _cam = _Cam(_cfg, self.scene)
                         self._sensors['wrist_camera'] = _cam
                         print(f"Wrist camera mounted on: {_hand.name}")
                     except Exception:
