@@ -145,7 +145,73 @@ print(f"Setting up ManiSkill env: {TASK} ...")
 import gymnasium as gym
 import mani_skill.envs   # registers the environments
 
-env = gym.make(
+# ── Wrist camera environment factory ─────────────────────────────────────────
+_WRIST_REGISTERED = set()
+
+def make_env_with_wrist(task_id, **kwargs):
+    """
+    Create a ManiSkill3 env with a wrist camera mounted on panda_hand_tcp.
+    Falls back to the base env (base_camera only) if camera mounting fails.
+    """
+    wrist_id = task_id.replace("-v", "Wrist-v")
+
+    if wrist_id not in _WRIST_REGISTERED:
+        try:
+            from mani_skill.sensors.camera import CameraConfig
+
+            # Resolve Pose: prefer mani_skill, fall back to sapien
+            try:
+                from mani_skill.utils.structs.pose import Pose
+            except ImportError:
+                import sapien; Pose = sapien.Pose
+
+            spec = gym.envs.registry.get(task_id)
+            if spec is None:
+                raise ValueError(f"{task_id!r} not in gym registry")
+
+            ep = spec.entry_point
+            if isinstance(ep, str):
+                import importlib
+                mod_path, cls_name = ep.rsplit(":", 1)
+                base_cls = getattr(importlib.import_module(mod_path), cls_name)
+            else:
+                base_cls = ep
+
+            # Panda hand TCP: slight forward + downward offset, rotated to face down
+            _wrist_pose = Pose([0.0464982, -0.0200011, 0.0360011],
+                               [0, 0.70710678, 0, 0.70710678])
+
+            class _WristEnv(base_cls):
+                @property
+                def _default_sensor_configs(self):
+                    cfgs = list(super()._default_sensor_configs)
+                    cfgs.append(CameraConfig(
+                        uid="wrist_camera",
+                        pose=_wrist_pose,
+                        width=384, height=384,
+                        fov=1.57, near=0.01, far=100,
+                        entity_uid="panda_hand_tcp",
+                    ))
+                    return cfgs
+
+            _WristEnv.__name__     = f"{base_cls.__name__}Wrist"
+            _WristEnv.__qualname__ = _WristEnv.__name__
+
+            ms = getattr(spec, 'max_episode_steps', None) or 200
+            gym.register(wrist_id, entry_point=_WristEnv, max_episode_steps=ms)
+            _WRIST_REGISTERED.add(wrist_id)
+            print(f"Registered wrist-camera env: {wrist_id}")
+
+        except Exception as _e:
+            print(f"Wrist camera unavailable ({_e}) — using {task_id}")
+            _WRIST_REGISTERED.add(wrist_id)   # mark as attempted so we don't retry
+            return gym.make(task_id, **kwargs)
+
+    use_id = wrist_id if wrist_id in gym.envs.registry else task_id
+    return gym.make(use_id, **kwargs)
+
+
+env = make_env_with_wrist(
     TASK,
     obs_mode="rgb",
     render_mode="rgb_array",
