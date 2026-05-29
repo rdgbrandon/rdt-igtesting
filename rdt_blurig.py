@@ -36,7 +36,14 @@ SIGLIP_ID = "google/siglip-so400m-patch14-384"
 
 LANG_PT   = os.environ.get("LANG_EMBED", "lang_embed.pt")
 TASK      = os.environ.get("MANISKILL_TASK", "PickCube-v1")
-TASK_TEXT = "pick up the cube"
+_TASK_LABELS = {
+    "PickCube-v1":         "pick up the cube",
+    "StackCube-v1":        "stack the cubes",
+    "PushCube-v1":         "push the cube",
+    "PegInsertionSide-v1": "insert the peg",
+    "PlugCharger-v1":      "plug the charger",
+}
+TASK_TEXT = _TASK_LABELS.get(TASK, TASK)
 
 N_DDPM_STEPS   = 5
 N_BLURIG_STEPS = 20
@@ -272,7 +279,6 @@ def rdt_score(E_t):
             lang_cond, lang_attn_mask, img_cond,
             state_traj, action_mask, ctrl_freqs,
         )  # (1, 64, 128)
-    # MANISKILL_INDICES[6] = gripper_open (index 10 in state vec)
     gripper_idx = MANISKILL_INDICES[7]
     return actions[:, :SCORE_HORIZON, gripper_idx].norm()
 
