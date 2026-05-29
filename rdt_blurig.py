@@ -196,8 +196,22 @@ def make_env_with_wrist(task_id, **kwargs):
                     else:
                         base_cls = ep
 
-                _wrist_pose = Pose(p=[0.0464982, -0.0200011, 0.0360011],
-                                   q=[0, 0.70710678, 0, 0.70710678])
+                # Try multiple Pose constructor forms across SAPIEN / ManiSkill versions
+                _p = [0.0464982, -0.0200011, 0.0360011]
+                _q = [0, 0.70710678, 0, 0.70710678]
+                _wrist_pose = None
+                for _pose_fn in [
+                    lambda: Pose(p=_p, q=_q),
+                    lambda: Pose(_p, _q),
+                    lambda: Pose(__import__('numpy').array(_p + _q)),
+                    lambda: Pose(__import__('numpy').array(_p + _q, dtype='float32')),
+                ]:
+                    try:
+                        _wrist_pose = _pose_fn(); break
+                    except Exception:
+                        continue
+                if _wrist_pose is None:
+                    raise RuntimeError("Cannot construct sapien.Pose — all forms failed")
 
                 # Try both known kwarg names for link-mounted cameras across ManiSkill versions
                 def _make_cam_cfg():
