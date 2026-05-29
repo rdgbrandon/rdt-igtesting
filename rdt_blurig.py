@@ -213,24 +213,20 @@ def make_env_with_wrist(task_id, **kwargs):
                 if _wrist_pose is None:
                     raise RuntimeError("Cannot construct sapien.Pose — all forms failed")
 
-                # Try both known kwarg names for link-mounted cameras across ManiSkill versions
-                def _make_cam_cfg():
-                    for uid_kw in ("actor_uid", "entity_uid"):
-                        try:
-                            return CameraConfig(
-                                uid="wrist_camera", pose=_wrist_pose,
-                                width=384, height=384, fov=1.57,
-                                near=0.01, far=100, **{uid_kw: "panda_hand_tcp"},
-                            )
-                        except TypeError:
-                            continue
-                    # Last resort: no link mount (will be a world-fixed camera)
-                    return CameraConfig(
-                        uid="wrist_camera", pose=_wrist_pose,
-                        width=384, height=384, fov=1.57, near=0.01, far=100,
-                    )
+                # World-fixed close-up camera: look_at gives a pose aimed at the
+                # manipulation workspace from a low front angle, approximating the
+                # wrist view RDT was trained with. entity_uid mounting is skipped
+                # because ManiSkill3's Camera.__init__ has a bug with that path.
+                try:
+                    from mani_skill.utils.sapien_utils import look_at as _look_at
+                    _wrist_pose = _look_at(eye=[0.15, 0.4, 0.3], target=[0.0, 0.0, 0.05])
+                except Exception:
+                    pass  # keep the original Pose if look_at fails
 
-                _cam_cfg = _make_cam_cfg()
+                _cam_cfg = CameraConfig(
+                    uid="wrist_camera", pose=_wrist_pose,
+                    width=384, height=384, fov=1.57, near=0.01, far=100,
+                )
 
                 class _WristEnv(base_cls):
                     @property
