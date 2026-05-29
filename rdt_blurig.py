@@ -134,8 +134,11 @@ MANISKILL_INDICES = (
 )
 
 # Normalization stats from maniskill_model.py DATA_STAT
-STATE_MIN = torch.tensor([-0.7463, -0.0801, -0.4976, -2.6578, -0.5743,  1.8310, -2.2424, 0.0000])
-STATE_MAX = torch.tensor([ 0.7645,  1.4967,  0.4651, -0.3867,  0.5506,  3.2901,  2.5738, 0.0400])
+STATE_MIN  = torch.tensor([-0.7463, -0.0801, -0.4976, -2.6578, -0.5743,  1.8310, -2.2424,  0.0000])
+STATE_MAX  = torch.tensor([ 0.7645,  1.4967,  0.4651, -0.3867,  0.5506,  3.2901,  2.5738,  0.0400])
+# Action range differs from state range — gripper is [-1, 1] in action space, not [0, 0.04]
+ACTION_MIN = torch.tensor([-0.7472, -0.0863, -0.4995, -2.6584, -0.5751,  1.8291, -2.2452, -1.0000])
+ACTION_MAX = torch.tensor([ 0.7655,  1.4984,  0.4679, -0.3818,  0.5517,  3.2916,  2.5758,  1.0000])
 
 # ── ManiSkill simulation ──────────────────────────────────────────────────────
 print(f"Setting up ManiSkill env: {TASK} ...")
@@ -231,6 +234,22 @@ print(f"SigLIP grid: {grid_size}x{grid_size}  patches={n_patches}  dim={embed_di
 # ── RDT-1B ───────────────────────────────────────────────────────────────────
 print(f"Loading {RDT_HF_ID} ...")
 rdt = RDTRunner.from_pretrained(RDT_HF_ID)
+
+# Try to overlay ManiSkill fine-tuned weights on top of the base model.
+# The maniskill-model repo contains a DeepSpeed checkpoint (mp_rank_00_model_states.pt)
+# that was fine-tuned specifically on these 5 ManiSkill tasks.
+try:
+    from huggingface_hub import hf_hub_download as _hf_dl
+    _ckpt_path = _hf_dl("robotics-diffusion-transformer/maniskill-model",
+                         "rdt/mp_rank_00_model_states.pt")
+    _ckpt = torch.load(_ckpt_path, map_location="cpu", weights_only=False)
+    _sd   = _ckpt.get("module", _ckpt)   # DeepSpeed wraps weights in 'module'
+    missing, unexpected = rdt.load_state_dict(_sd, strict=False)
+    print(f"ManiSkill fine-tuned weights loaded "
+          f"(missing={len(missing)}, unexpected={len(unexpected)})")
+except Exception as _e:
+    print(f"ManiSkill fine-tune not loaded ({_e}) — using base rdt-1b weights")
+
 rdt.to(DEVICE, dtype=DTYPE).eval()
 for p in rdt.parameters():
     p.requires_grad_(False)
