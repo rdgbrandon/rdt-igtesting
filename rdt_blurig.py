@@ -198,8 +198,8 @@ def make_env_with_wrist(task_id, **kwargs):
                     else:
                         base_cls = ep
 
-                _wrist_pose = Pose([0.0464982, -0.0200011, 0.0360011],
-                                   [0, 0.70710678, 0, 0.70710678])
+                _wrist_pose = Pose(p=[0.0464982, -0.0200011, 0.0360011],
+                                   q=[0, 0.70710678, 0, 0.70710678])
 
                 # Try both known kwarg names for link-mounted cameras across ManiSkill versions
                 def _make_cam_cfg():
