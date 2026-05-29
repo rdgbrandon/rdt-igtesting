@@ -173,11 +173,9 @@ def make_env_with_wrist(task_id, **kwargs):
             try:
                 from mani_skill.sensors.camera import CameraConfig
 
-                # Resolve Pose: prefer mani_skill wrapper, fall back to sapien
-                try:
-                    from mani_skill.utils.structs.pose import Pose
-                except ImportError:
-                    import sapien; Pose = sapien.Pose
+                # Use sapien.Pose directly — the ManiSkill wrapper has a non-standard constructor
+                import sapien as _sapien
+                Pose = _sapien.Pose
 
                 # Resolve base class: direct import preferred over gym registry parsing
                 base_cls = None
