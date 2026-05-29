@@ -198,8 +198,8 @@ def make_env_with_wrist(task_id, **kwargs):
             # `self.entity = None`), causing AttributeError at line 152.
             # Using mount= hits line 139-140 which works correctly.
             class _WristEnv(base_cls):
-                def _setup_sensors(self):
-                    super()._setup_sensors()
+                def _setup_sensors(self, *args, **kwargs):
+                    super()._setup_sensors(*args, **kwargs)
                     try:
                         from mani_skill.sensors.camera import CameraConfig as _CC
                         from mani_skill.sensors.camera import Camera as _Cam
