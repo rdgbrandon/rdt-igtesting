@@ -166,89 +166,67 @@ def make_env_with_wrist(task_id, **kwargs):
     wrist_id = task_id.replace("-v", "Wrist-v")
 
     if wrist_id not in _WRIST_REGISTERED:
-        # Already registered by a previous %run but _WRIST_REGISTERED was reset
+        # Purge any stale registration from a previous %run so we always re-register
         if wrist_id in gym.envs.registry:
-            _WRIST_REGISTERED.add(wrist_id)
-        else:
-            try:
-                from mani_skill.sensors.camera import CameraConfig
+            del gym.envs.registry[wrist_id]
+        try:
+            from mani_skill.sensors.camera import CameraConfig
+            import sapien as _sapien
 
-                # Use sapien.Pose directly — the ManiSkill wrapper has a non-standard constructor
-                import sapien as _sapien
-                Pose = _sapien.Pose
-
-                # Resolve base class: direct import preferred over gym registry parsing
-                base_cls = None
-                if task_id in _TASK_MODULES:
-                    mod_path, cls_name = _TASK_MODULES[task_id]
-                    try:
-                        base_cls = getattr(importlib.import_module(mod_path), cls_name)
-                    except Exception:
-                        pass
-                if base_cls is None:
-                    spec = gym.envs.registry.get(task_id)
-                    if spec is None:
-                        raise ValueError(f"{task_id!r} not in gym registry")
-                    ep = spec.entry_point
-                    if isinstance(ep, str):
-                        mod_path, cls_name = ep.rsplit(":", 1)
-                        base_cls = getattr(importlib.import_module(mod_path), cls_name)
-                    else:
-                        base_cls = ep
-
-                # Try multiple Pose constructor forms across SAPIEN / ManiSkill versions
-                _p = [0.0464982, -0.0200011, 0.0360011]
-                _q = [0, 0.70710678, 0, 0.70710678]
-                _wrist_pose = None
-                for _pose_fn in [
-                    lambda: Pose(p=_p, q=_q),
-                    lambda: Pose(_p, _q),
-                    lambda: Pose(__import__('numpy').array(_p + _q)),
-                    lambda: Pose(__import__('numpy').array(_p + _q, dtype='float32')),
-                ]:
-                    try:
-                        _wrist_pose = _pose_fn(); break
-                    except Exception:
-                        continue
-                if _wrist_pose is None:
-                    raise RuntimeError("Cannot construct sapien.Pose — all forms failed")
-
-                # World-fixed close-up camera: look_at gives a pose aimed at the
-                # manipulation workspace from a low front angle, approximating the
-                # wrist view RDT was trained with. entity_uid mounting is skipped
-                # because ManiSkill3's Camera.__init__ has a bug with that path.
+            # Resolve base class via direct import first, then gym registry
+            base_cls = None
+            if task_id in _TASK_MODULES:
+                mod_path, cls_name = _TASK_MODULES[task_id]
                 try:
-                    from mani_skill.utils.sapien_utils import look_at as _look_at
-                    _wrist_pose = _look_at(eye=[0.15, 0.4, 0.3], target=[0.0, 0.0, 0.05])
+                    base_cls = getattr(importlib.import_module(mod_path), cls_name)
                 except Exception:
-                    pass  # keep the original Pose if look_at fails
-
-                _cam_cfg = CameraConfig(
-                    uid="wrist_camera", pose=_wrist_pose,
-                    width=384, height=384, fov=1.57, near=0.01, far=100,
-                )
-
-                class _WristEnv(base_cls):
-                    @property
-                    def _default_sensor_configs(self):
-                        cfgs = list(super()._default_sensor_configs)
-                        cfgs.append(_cam_cfg)
-                        return cfgs
-
-                _WristEnv.__name__     = f"{base_cls.__name__}Wrist"
-                _WristEnv.__qualname__ = _WristEnv.__name__
-
+                    pass
+            if base_cls is None:
                 spec = gym.envs.registry.get(task_id)
-                ms   = getattr(spec, 'max_episode_steps', None) or 200
-                gym.register(wrist_id, entry_point=_WristEnv, max_episode_steps=ms)
-                _WRIST_REGISTERED.add(wrist_id)
-                print(f"Registered wrist-camera env: {wrist_id}")
+                if spec is None:
+                    raise ValueError(f"{task_id!r} not in gym registry")
+                ep = spec.entry_point
+                if isinstance(ep, str):
+                    mod_path, cls_name = ep.rsplit(":", 1)
+                    base_cls = getattr(importlib.import_module(mod_path), cls_name)
+                else:
+                    base_cls = ep
 
-            except Exception as _e:
-                print(f"Wrist camera registration failed — falling back to {task_id}")
-                _tb.print_exc()
-                _WRIST_REGISTERED.add(wrist_id)
-                return gym.make(task_id, **kwargs)
+            # World-fixed close-up camera aimed at the manipulation workspace.
+            # entity_uid (wrist mount) is skipped — ManiSkill3 Camera.__init__
+            # has a bug (missing self.entity assignment) that crashes on that path.
+            try:
+                from mani_skill.utils.sapien_utils import look_at as _look_at
+                _cam_pose = _look_at(eye=[0.15, 0.4, 0.3], target=[0.0, 0.0, 0.05])
+            except Exception:
+                _cam_pose = _sapien.Pose(p=[0.15, 0.4, 0.3], q=[0.5, 0.5, 0.5, 0.5])
+
+            _cam_cfg = CameraConfig(
+                uid="wrist_camera", pose=_cam_pose,
+                width=384, height=384, fov=1.57, near=0.01, far=100,
+            )
+
+            class _WristEnv(base_cls):
+                @property
+                def _default_sensor_configs(self):
+                    cfgs = list(super()._default_sensor_configs)
+                    cfgs.append(_cam_cfg)
+                    return cfgs
+
+            _WristEnv.__name__     = f"{base_cls.__name__}Wrist"
+            _WristEnv.__qualname__ = _WristEnv.__name__
+
+            spec = gym.envs.registry.get(task_id)
+            ms   = getattr(spec, 'max_episode_steps', None) or 200
+            gym.register(wrist_id, entry_point=_WristEnv, max_episode_steps=ms)
+            _WRIST_REGISTERED.add(wrist_id)
+            print(f"Registered wrist-camera env: {wrist_id}")
+
+        except Exception as _e:
+            print(f"Wrist camera registration failed — falling back to {task_id}")
+            _tb.print_exc()
+            _WRIST_REGISTERED.add(wrist_id)
+            return gym.make(task_id, **kwargs)
 
     use_id = wrist_id if wrist_id in gym.envs.registry else task_id
     return gym.make(use_id, **kwargs)
