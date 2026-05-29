@@ -43,7 +43,15 @@ _TASK_LABELS = {
     "PegInsertionSide-v1": "insert the peg",
     "PlugCharger-v1":      "plug the charger",
 }
-TASK_TEXT = _TASK_LABELS.get(TASK, TASK)
+_TASK_DESCRIPTIONS = {
+    "PickCube-v1":         "Grasp a red cube and move it to a target goal position.",
+    "StackCube-v1":        "Pick up a red cube and stack it on top of a green cube and let go of the cube without it falling.",
+    "PushCube-v1":         "Push and move a cube to a goal region in front of it.",
+    "PegInsertionSide-v1": "Pick up a orange-white peg and insert the orange end into the box with a hole in it.",
+    "PlugCharger-v1":      "Pick up one of the misplaced shapes on the board/kit and insert it into the correct empty slot.",
+}
+TASK_TEXT        = _TASK_LABELS.get(TASK, TASK)
+TASK_DESCRIPTION = _TASK_DESCRIPTIONS.get(TASK, TASK_TEXT)
 
 N_DDPM_STEPS   = 5
 N_BLURIG_STEPS = 20
