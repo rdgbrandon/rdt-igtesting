@@ -192,26 +192,55 @@ def make_env_with_wrist(task_id, **kwargs):
                 else:
                     base_cls = ep
 
-            # World-fixed close-up camera aimed at the manipulation workspace.
-            # entity_uid (wrist mount) is skipped — ManiSkill3 Camera.__init__
-            # has a bug (missing self.entity assignment) that crashes on that path.
-            try:
-                from mani_skill.utils.sapien_utils import look_at as _look_at
-                _cam_pose = _look_at(eye=[0.15, 0.4, 0.3], target=[0.0, 0.0, 0.05])
-            except Exception:
-                _cam_pose = _sapien.Pose(p=[0.15, 0.4, 0.3], q=[0.5, 0.5, 0.5, 0.5])
-
-            _cam_cfg = CameraConfig(
-                uid="wrist_camera", pose=_cam_pose,
-                width=384, height=384, fov=1.57, near=0.01, far=100,
-            )
-
+            # Mount wrist camera via _setup_sensors override using mount=link.
+            # camera.py has a bug: when entity_uid is used but articulation=None,
+            # self.entity is never set (line 144-145 does `pass` instead of
+            # `self.entity = None`), causing AttributeError at line 152.
+            # Using mount= hits line 139-140 which works correctly.
             class _WristEnv(base_cls):
-                @property
-                def _default_sensor_configs(self):
-                    cfgs = list(super()._default_sensor_configs)
-                    cfgs.append(_cam_cfg)
-                    return cfgs
+                def _setup_sensors(self):
+                    super()._setup_sensors()
+                    try:
+                        from mani_skill.sensors.camera import CameraConfig as _CC
+                        from mani_skill.sensors.camera import Camera as _Cam
+                        import numpy as _np2
+
+                        # Find TCP/hand link
+                        _hand = None
+                        for _lnk in self.agent.robot.get_links():
+                            if _lnk.name in ('panda_hand_tcp', 'tcp', 'panda_hand'):
+                                _hand = _lnk; break
+                        if _hand is None:
+                            for _lnk in self.agent.robot.get_links():
+                                if 'tcp' in _lnk.name.lower() or 'hand' in _lnk.name.lower():
+                                    _hand = _lnk; break
+                        if _hand is None:
+                            _names = [l.name for l in self.agent.robot.get_links()]
+                            print(f"Wrist cam: no TCP link. Links: {_names}")
+                            return
+
+                        # Identity local pose — camera sits at the TCP frame origin
+                        _lp = None
+                        for _pf in [
+                            lambda: _sapien.Pose(p=[0,0,0], q=[1,0,0,0]),
+                            lambda: _sapien.Pose([0,0,0], [1,0,0,0]),
+                            lambda: _sapien.Pose(_np2.array([0,0,0,1,0,0,0], dtype='float32')),
+                            lambda: _sapien.Pose(_np2.zeros(7, dtype='float32')),
+                            lambda: _sapien.Pose(),
+                        ]:
+                            try: _lp = _pf(); break
+                            except: continue
+                        if _lp is None:
+                            print("Wrist cam: cannot construct Pose"); return
+
+                        _cfg = _CC(uid="wrist_camera", pose=_lp,
+                                   width=384, height=384, fov=1.57,
+                                   near=0.01, far=100, mount=_hand)
+                        _cam = _Cam(_cfg, self._scene)
+                        self._sensors['wrist_camera'] = _cam
+                        print(f"Wrist camera mounted on: {_hand.name}")
+                    except Exception:
+                        import traceback as _tb2; _tb2.print_exc()
 
             _WristEnv.__name__     = f"{base_cls.__name__}Wrist"
             _WristEnv.__qualname__ = _WristEnv.__name__
