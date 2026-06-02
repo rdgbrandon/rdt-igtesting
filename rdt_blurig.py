@@ -53,7 +53,7 @@ _TASK_DESCRIPTIONS = {
 TASK_TEXT        = _TASK_LABELS.get(TASK, TASK)
 TASK_DESCRIPTION = _TASK_DESCRIPTIONS.get(TASK, TASK_TEXT)
 
-N_DDPM_STEPS   = 10
+N_DDPM_STEPS   = 5
 N_BLURIG_STEPS = 20
 SIGMA_MAX      = 2.0
 SCORE_HORIZON  = 8   # first N action steps used for gripper score
@@ -370,8 +370,10 @@ rdt.to(DEVICE, dtype=DTYPE).eval()
 for p in rdt.parameters():
     p.requires_grad_(False)
 rdt.num_inference_timesteps = N_DDPM_STEPS
-if hasattr(rdt, "noise_scheduler"):
-    rdt.noise_scheduler.set_timesteps(N_DDPM_STEPS)
+# RDT uses DPMSolverMultistepScheduler for inference, DDPMScheduler for training
+for _sched_attr in ("noise_scheduler_sample", "noise_scheduler"):
+    if hasattr(rdt, _sched_attr):
+        getattr(rdt, _sched_attr).set_timesteps(N_DDPM_STEPS)
 
 ACTION_DIM  = rdt.action_dim    # 128
 PRED_HORIZ  = rdt.pred_horizon  # 64
