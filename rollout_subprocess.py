@@ -59,12 +59,16 @@ for _pkg in ('wandb', 'deepspeed', 'flash_attn'):
     sys.modules[_pkg] = _make_stub(_pkg)
 
 # ── Monkey-patch T5 loading so we can skip it (we use pre-computed embeddings) ─
+import torch.nn as nn
 import scripts.maniskill_model as _msm
 
-_orig_get_text = _msm.RoboticDiffusionTransformerModel.get_text_encoder
+class _NoopTextModel(nn.Module):
+    """Drop-in for the T5 text encoder when using pre-computed embeddings."""
+    def forward(self, *a, **kw): return None
+
 def _skip_text_encoder(self, path):
     print('WORKER: Skipping T5 load (using pre-computed embeddings)', flush=True)
-    return None, None
+    return _NoopTextModel(), None
 _msm.RoboticDiffusionTransformerModel.get_text_encoder = _skip_text_encoder
 
 # ── Load config and create model ──────────────────────────────────────────────
