@@ -71,6 +71,16 @@ def _skip_text_encoder(self, path):
     return _NoopTextModel(), None
 _msm.RoboticDiffusionTransformerModel.get_text_encoder = _skip_text_encoder
 
+# Also patch reset() — when pretrained_text_encoder_name_or_path=None, __init__
+# sets self.text_model=None directly without calling get_text_encoder, so reset()
+# crashes on self.text_model.eval(). Swap in the noop before delegating.
+_orig_reset = _msm.RoboticDiffusionTransformerModel.reset
+def _patched_reset(self):
+    if self.text_model is None:
+        self.text_model = _NoopTextModel()
+    _orig_reset(self)
+_msm.RoboticDiffusionTransformerModel.reset = _patched_reset
+
 # ── Load config and create model ──────────────────────────────────────────────
 import yaml
 from scripts.maniskill_model import RoboticDiffusionTransformerModel
