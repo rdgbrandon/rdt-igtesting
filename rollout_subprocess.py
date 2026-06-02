@@ -18,11 +18,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--task',        default='PickCube-v1')
 parser.add_argument('--n',           type=int, default=25)
 parser.add_argument('--base-seed',   type=int, default=20241201)
-parser.add_argument('--random-seed', type=int, default=0)
+parser.add_argument('--random-seed', type=int, default=None)
 args = parser.parse_args()
 
 # ── Set random seeds exactly as official eval does ────────────────────────────
-seed = args.random_seed
+import time
+seed = args.random_seed if args.random_seed is not None else int(time.time()) % 100000
+args.random_seed = seed
 random.seed(seed)
 os.environ['PYTHONHASHSEED'] = str(seed)
 
