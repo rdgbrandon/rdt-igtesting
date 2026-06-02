@@ -161,13 +161,11 @@ for ep in range(args.n):
     info = {}
 
     while global_steps < 400 and not done:
-        image_arrs = []
+        images = []
         for window_img in obs_window:
-            image_arrs.append(window_img)
-            image_arrs.append(None)
-            image_arrs.append(None)
-        images = [PILImage.fromarray(arr.astype(np.uint8)) if arr is not None else None
-                  for arr in image_arrs]
+            images.append(window_img)  # already PIL or None
+            images.append(None)
+            images.append(None)
 
         # Official: policy.step(proprio, images, text_embed)
         with torch.no_grad():
@@ -177,8 +175,7 @@ for ep in range(args.n):
         for idx in range(actions.shape[0]):
             obs, _, terminated, truncated, info = _env.step(actions[idx])
             img = _render_pil(_env)
-            if hasattr(img, 'cpu'): img = img.cpu().numpy()
-            obs_window.append(np.array(img))
+            obs_window.append(img)
             proprio = obs['agent']['qpos'][:, :-1]
             global_steps += 1
             if terminated or truncated:
