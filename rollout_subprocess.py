@@ -149,6 +149,7 @@ results = []
 for ep in range(args.n):
     _env = _make_env()
     obs, _ = _env.reset(seed=ep + args.base_seed)
+    policy.reset()  # clear internal action buffer between episodes
 
     obs_window = deque(maxlen=2)
     img = _render_pil(_env)
