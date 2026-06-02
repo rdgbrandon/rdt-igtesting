@@ -49,7 +49,8 @@ def _make_stub(name):
         def __call__(self, *a, **kw): return None
     m = _S(name)
     m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
-    m.__path__ = []; m.__file__ = ''; m.__package__ = name.split('.')[0]
+    m.__path__ = []; m.__file__ = f'/tmp/_stub_{name.replace(".", "_")}.py'
+    m.__package__ = name.split('.')[0]
     return m
 
 for _pkg in ('wandb', 'deepspeed', 'flash_attn'):
