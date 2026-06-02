@@ -122,25 +122,22 @@ if text_embed.dim() == 2:
     text_embed = text_embed.unsqueeze(0)
 print(f'WORKER: text_embed shape: {text_embed.shape}', flush=True)
 
-# ── Env setup ─────────────────────────────────────────────────────────────────
+# ── Env setup (single env reused across all episodes, matching official eval) ──
 import gymnasium as gym
 import mani_skill.envs
 from PIL import Image as PILImage
 
-def _make_env(max_ep=400):
-    _e = gym.make(args.task, obs_mode='rgb', render_mode='rgb_array',
-                  control_mode='pd_joint_pos')
-    _w = _e
-    while _w is not None:
-        if hasattr(_w, '_max_episode_steps'):
-            _w._max_episode_steps = max_ep; break
-        _w = getattr(_w, 'env', None)
-    return _e
-
-def _render_pil(env):
-    r = env.render()
-    if hasattr(r, 'cpu'): r = r.cpu().numpy()
-    return PILImage.fromarray(np.array(r).squeeze().astype(np.uint8))
+env = gym.make(
+    args.task,
+    obs_mode='rgb',
+    render_mode='rgb_array',
+    control_mode='pd_joint_pos',
+    reward_mode='dense',
+    sensor_configs=dict(shader_pack='default'),
+    human_render_camera_configs=dict(shader_pack='default'),
+    viewer_camera_configs=dict(shader_pack='default'),
+    sim_backend='auto',
+)
 
 # ── Rollout (exact official eval loop) ───────────────────────────────────────
 from collections import deque
@@ -149,35 +146,35 @@ print(f"\n{'ep':>4}  {'seed':>10}  {'result':>10}  {'steps':>6}", flush=True)
 results = []
 
 for ep in range(args.n):
-    _env = _make_env()
-    obs, _ = _env.reset(seed=ep + args.base_seed)
-    policy.reset()  # clear internal action buffer between episodes
-
     obs_window = deque(maxlen=2)
-    img = _render_pil(_env)
+    obs, _ = env.reset(seed=ep + args.base_seed)
+    policy.reset()
+
+    img = env.render().squeeze(0).detach().cpu().numpy()
     obs_window.append(None)
-    obs_window.append(img)
-    proprio = obs['agent']['qpos'][:, :-1]  # (1, 8) tensor
+    obs_window.append(np.array(img))
+    proprio = obs['agent']['qpos'][:, :-1]
 
     global_steps = 0
     done = False
     info = {}
 
     while global_steps < 400 and not done:
-        images = []
+        image_arrs = []
         for window_img in obs_window:
-            images.append(window_img)  # already PIL or None
-            images.append(None)
-            images.append(None)
+            image_arrs.append(window_img)
+            image_arrs.append(None)
+            image_arrs.append(None)
+        images = [PILImage.fromarray(arr) if arr is not None else None
+                  for arr in image_arrs]
 
-        # Official: policy.step(proprio, images, text_embed)
         with torch.no_grad():
             actions = policy.step(proprio, images, text_embed).squeeze(0).cpu().numpy()
-        actions = actions[::4, :]  # stride-4: 64 → 16
+        actions = actions[::4, :]
 
         for idx in range(actions.shape[0]):
-            obs, _, terminated, truncated, info = _env.step(actions[idx])
-            img = _render_pil(_env)
+            obs, _, terminated, truncated, info = env.step(actions[idx])
+            img = env.render().squeeze(0).detach().cpu().numpy()
             obs_window.append(img)
             proprio = obs['agent']['qpos'][:, :-1]
             global_steps += 1
