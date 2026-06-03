@@ -68,8 +68,18 @@ ACTION_MIN_t = ACTION_MIN.to(DEVICE, dtype=DTYPE)
 ACTION_MAX_t = ACTION_MAX.to(DEVICE, dtype=DTYPE)
 
 
+def _expand2square(img, bg):
+    w, h = img.size
+    if w == h:
+        return img
+    side = max(w, h)
+    out = PILImage.new(img.mode, (side, side), bg)
+    out.paste(img, ((side - w) // 2, (side - h) // 2))
+    return out
+
 def _encode_6(pil_list):
-    imgs = [(_bg_img if img is None else img) for img in pil_list]
+    bg = tuple(int(x * 255) for x in siglip_proc.image_mean)
+    imgs = [_expand2square(_bg_img if img is None else img, bg) for img in pil_list]
     pvs  = siglip_proc(images=imgs, return_tensors='pt')['pixel_values'].to(DEVICE, dtype=DTYPE)
     with torch.no_grad():
         embs = siglip(pixel_values=pvs).last_hidden_state
@@ -79,7 +89,10 @@ def _encode_6(pil_list):
 def _render_pil(env):
     r = env.render()
     if hasattr(r, 'cpu'): r = r.cpu().numpy()
-    return PILImage.fromarray(np.array(r).squeeze().astype(np.uint8))
+    img = PILImage.fromarray(np.array(r).squeeze().astype(np.uint8))
+    if img.width != img.height:
+        print(f'WORKER: non-square render {img.width}x{img.height}', flush=True)
+    return img
 
 
 def _make_env(max_ep=400):
