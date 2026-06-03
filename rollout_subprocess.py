@@ -133,6 +133,7 @@ env = gym.make(
     render_mode='rgb_array',
     control_mode='pd_joint_pos',
     reward_mode='dense',
+    max_episode_steps=400,
     sensor_configs=dict(shader_pack='default'),
     human_render_camera_configs=dict(shader_pack='default'),
     viewer_camera_configs=dict(shader_pack='default'),
