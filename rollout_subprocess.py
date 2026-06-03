@@ -82,7 +82,7 @@ def _render_pil(env):
     return PILImage.fromarray(np.array(r).squeeze().astype(np.uint8))
 
 
-def _make_env(max_ep=1000):
+def _make_env(max_ep=400):
     _e = gym.make(args.task, obs_mode='rgb', render_mode='rgb_array',
                   control_mode='pd_joint_pos')
     _w = _e
@@ -99,7 +99,7 @@ def rollout(ep_idx):
     _hist = deque([None, _render_pil(_env)], maxlen=2)
     chunk, cp, done, step, info = None, 16, False, 0, {}
 
-    while not done and step < 1000:
+    while not done and step < 400:
         if cp >= 16:
             _raw = _encode_6([_hist[0], None, None, _hist[1], None, None])
             _qp  = _obs['agent']['qpos']
