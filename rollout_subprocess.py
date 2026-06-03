@@ -182,7 +182,6 @@ for ep in range(args.n):
                 done = True
                 break
 
-    _env.close()
     s = bool(info.get('success', False))
     results.append(s)
     print(f'  {ep:2d}  {ep+args.base_seed:10d}    {"SUCCESS" if s else "fail   "} ({global_steps:4d})',
