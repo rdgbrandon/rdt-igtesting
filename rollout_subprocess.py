@@ -109,7 +109,8 @@ def _make_env(max_ep=400):
 def rollout(ep_idx):
     _env = _make_env()
     _obs, _ = _env.reset(seed=ep_idx + args.base_seed)
-    _hist = deque([None, _render_pil(_env)], maxlen=2)
+    first_frame = _render_pil(_env)
+    _hist = deque([None, first_frame], maxlen=2)
     chunk, cp, done, step, info = None, 16, False, 0, {}
 
     while not done and step < 400:
@@ -145,15 +146,25 @@ def rollout(ep_idx):
         cp += 1; step += 1
 
     _env.close()
-    return bool(info.get('success', False)), step
+    success = bool(info.get('success', False))
+    if success:
+        first_frame.save(f'success_ep{ep_idx:02d}_seed{ep_idx+args.base_seed}.png')
+    return success, step
 
 
+import json
 print(f"\n{'ep':>4}  {'seed':>10}  {'result':>10}  {'steps':>6}", flush=True)
-results = []
+results, success_meta = [], []
 for ep in range(args.n):
     s, t = rollout(ep)
     results.append(s)
+    if s:
+        success_meta.append({'ep': ep, 'seed': ep + args.base_seed,
+                             'frame': f'success_ep{ep:02d}_seed{ep+args.base_seed}.png'})
     print(f"  {ep:2d}  {ep+args.base_seed:10d}    {'SUCCESS' if s else 'fail   '} ({t:4d})", flush=True)
 
 n = sum(results)
 print(f"\nSuccess rate: {n}/{args.n}  ({100*n/args.n:.0f}%)", flush=True)
+with open('success_frames.json', 'w') as f:
+    json.dump({'task': args.task, 'base_seed': args.base_seed, 'successes': success_meta}, f)
+print(f"Saved {n} success frames + success_frames.json", flush=True)
