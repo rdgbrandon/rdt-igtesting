@@ -5,6 +5,9 @@ from PIL import Image as PILImage
 from IPython.display import display, Image as IPyImage
 from transformers import AutoTokenizer
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DTYPE  = torch.bfloat16 if DEVICE == 'cuda' else torch.float32
+
 with open('success_frames.json') as f:
     meta = json.load(f)
 task           = meta['task']
