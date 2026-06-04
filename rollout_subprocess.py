@@ -110,7 +110,8 @@ def rollout(ep_idx):
     _env = _make_env()
     _obs, _ = _env.reset(seed=ep_idx + args.base_seed)
     first_frame = _render_pil(_env)
-    _hist = deque([None, first_frame], maxlen=2)
+    _hist  = deque([None, first_frame], maxlen=2)
+    frames = [first_frame]  # collect all frames
     chunk, cp, done, step, info = None, 16, False, 0, {}
 
     while not done and step < 400:
@@ -141,30 +142,40 @@ def rollout(ep_idx):
             cp = 0
 
         _obs, _, term, trunc, info = _env.step(chunk[cp].reshape(1, 8))
-        _hist.append(_render_pil(_env))
+        f = _render_pil(_env)
+        _hist.append(f)
+        frames.append(f)
         done = bool(term) or bool(trunc)
         cp += 1; step += 1
 
     _env.close()
     success = bool(info.get('success', False))
     if success:
-        first_frame.save(f'success_ep{ep_idx:02d}_seed{ep_idx+args.base_seed}.png')
-    return success, step
+        # Sample 10 evenly spaced frames (including first and last)
+        n_total = len(frames)
+        indices = [int(round(i)) for i in np.linspace(0, n_total - 1, 10)]
+        frame_paths = []
+        for k, idx in enumerate(indices):
+            path = f'success_ep{ep_idx:02d}_seed{ep_idx+args.base_seed}_f{k:02d}.png'
+            frames[idx].save(path)
+            frame_paths.append({'step': idx, 'path': path})
+        return True, step, frame_paths
+    return False, step, []
 
 
 import json
 print(f"\n{'ep':>4}  {'seed':>10}  {'result':>10}  {'steps':>6}", flush=True)
 results, success_meta = [], []
 for ep in range(args.n):
-    s, t = rollout(ep)
+    s, t, frame_paths = rollout(ep)
     results.append(s)
     if s:
         success_meta.append({'ep': ep, 'seed': ep + args.base_seed,
-                             'frame': f'success_ep{ep:02d}_seed{ep+args.base_seed}.png'})
+                             'steps': t, 'frames': frame_paths})
     print(f"  {ep:2d}  {ep+args.base_seed:10d}    {'SUCCESS' if s else 'fail   '} ({t:4d})", flush=True)
 
 n = sum(results)
 print(f"\nSuccess rate: {n}/{args.n}  ({100*n/args.n:.0f}%)", flush=True)
 with open('success_frames.json', 'w') as f:
     json.dump({'task': args.task, 'base_seed': args.base_seed, 'successes': success_meta}, f)
-print(f"Saved {n} success frames + success_frames.json", flush=True)
+print(f"Saved {n} success episodes (10 frames each) + success_frames.json", flush=True)
