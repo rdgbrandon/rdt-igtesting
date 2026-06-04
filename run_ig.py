@@ -22,6 +22,14 @@ task2lang = {
     'PlugCharger-v1':      'Pick up one of the misplaced shapes and insert it into the correct slot.',
 }
 
+# Load lang_tokens from saved embed file
+_embed_path = 'lang_embed_' + task + '.pt'
+_ld = torch.load(_embed_path, map_location='cpu', weights_only=False)
+_lt = _ld if not isinstance(_ld, dict) else _ld['embeddings']
+if _lt.dim() == 2: _lt = _lt.unsqueeze(0)
+lang_tokens    = _lt.to(DEVICE, dtype=DTYPE)
+lang_attn_mask = torch.ones(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE)
+
 _tok  = AutoTokenizer.from_pretrained('t5-small')
 L_emb = lang_tokens.shape[1]
 _desc = task2lang.get(task, task)
