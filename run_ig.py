@@ -56,7 +56,28 @@ def _blur_emb(e, sigma):
         m = F.avg_pool2d(m, kernel_size=ks, stride=1, padding=ks // 2)
     return m.permute(0, 2, 3, 1).reshape(B, T, C)
 
-def run_ig(scene_emb, scene_state, am0):
+def blurig_image(scene_emb, scene_state, am0):
+    """BlurIG: overall image attribution map (summed over all actions/joints)."""
+    sigmas = [10.0, 7.5, 5.0, 2.5, 0.0]
+    wi_tot = torch.zeros_like(scene_emb)
+    for k in range(len(sigmas) - 1):
+        E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
+        E_next = _blur_emb(scene_emb.detach(), sigmas[k + 1])
+        with torch.enable_grad():
+            _ac = rdt.conditional_sample(
+                rdt.lang_adaptor(lang_tokens), lang_attn_mask,
+                rdt.img_adaptor(E_t.repeat(1, 6, 1)),
+                scene_state, am0, ctrl_freqs)
+        score = _ac[:, :8, :][:, :, _midx].norm()
+        g = torch.autograd.grad(score, E_t)[0]
+        wi_tot = wi_tot + g.detach() * (E_next - E_t.detach())
+    G      = int(scene_emb.shape[1] ** 0.5)
+    wi_map = wi_tot.squeeze(0).float().cpu().abs().sum(-1).reshape(G, G).numpy()
+    wi_map = (wi_map - wi_map.min()) / (wi_map.max() - wi_map.min() + 1e-8)
+    return wi_map
+
+def word_joint_ig(scene_emb, scene_state, am0):
+    """Token IG: word x joint attribution."""
     wj = [torch.zeros_like(lang_tokens) for _ in range(8)]
     for k in range(N_IG):
         alpha  = (k + 0.5) / N_IG
@@ -72,35 +93,32 @@ def run_ig(scene_emb, scene_state, am0):
             wj[j] = wj[j] + g.detach() * _dl.detach()
     attr_jt = np.array([wj[j].squeeze(0).float().cpu().abs().sum(-1).numpy() for j in range(8)])
     attr_jw = np.array([[attr_jt[j, g].sum() for g in groups] for j in range(8)])
-
-    sigmas = [10.0, 7.5, 5.0, 2.5, 0.0]
-    wi_tot = torch.zeros_like(scene_emb)
-    for k in range(len(sigmas) - 1):
-        E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
-        E_next = _blur_emb(scene_emb.detach(), sigmas[k + 1])
-        with torch.enable_grad():
-            _ac = rdt.conditional_sample(
-                rdt.lang_adaptor(lang_tokens), lang_attn_mask,
-                rdt.img_adaptor(E_t.repeat(1, 6, 1)),
-                scene_state, am0, ctrl_freqs)
-        score = _ac[:, :8, :][:, :, _midx].norm()
-        g = torch.autograd.grad(score, E_t)[0]
-        wi_tot = wi_tot + g.detach() * (E_next - E_t.detach())
-
-    G      = int(scene_emb.shape[1] ** 0.5)
-    wi_map = wi_tot.squeeze(0).float().cpu().abs().sum(-1).reshape(G, G).numpy()
-    wi_map = (wi_map - wi_map.min()) / (wi_map.max() - wi_map.min() + 1e-8)
-    return attr_jw, wi_map
+    return attr_jw
 
 _bil = getattr(PILImage, 'Resampling', PILImage).BILINEAR
+
+def _upsample(wi_map):
+    return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
+
+def _make_state(frame):
+    with torch.no_grad():
+        emb = encode_image(frame)
+        _s0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
+        _a0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
+        _a0[0, 0, MANISKILL_INDICES] = 1.0
+        state = rdt.state_adaptor(torch.cat([_s0, _a0], dim=2))
+    return emb, state, _a0
 
 for info in success_frames:
     ep, seed, steps, flist = info['ep'], info['seed'], info['steps'], info['frames']
     print('Episode', ep, 'seed=', seed, 'steps=', steps)
 
+    frames_pil = [PILImage.open(fd['path']).convert('RGB') for fd in flist]
+
+    # ── Row 1: raw frames ─────────────────────────────────────────────────────
     fig1, axes1 = plt.subplots(1, 10, figsize=(20, 2))
-    for k, fd in enumerate(flist):
-        axes1[k].imshow(np.array(PILImage.open(fd['path']).convert('RGB')))
+    for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
+        axes1[k].imshow(np.array(img_k))
         axes1[k].set_title('start' if k == 0 else ('SUCCESS' if k == 9 else 'step ' + str(fd['step'])), fontsize=6)
         axes1[k].axis('off')
     fig1.suptitle(task + '  ep' + str(ep) + '  seed' + str(seed) + '  (' + str(steps) + ' steps)', fontsize=9)
@@ -110,36 +128,42 @@ for info in success_frames:
     plt.close()
     display(IPyImage(strip_path))
 
-    scene_frame = PILImage.open(flist[0]['path']).convert('RGB')
-    with torch.no_grad():
-        scene_emb = encode_image(scene_frame)
-        _s0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
-        _a0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
-        _a0[0, 0, MANISKILL_INDICES] = 1.0
-        scene_state = rdt.state_adaptor(torch.cat([_s0, _a0], dim=2))
-
-    print('  Running IG...')
-    attr_jw, wi_map = run_ig(scene_emb, scene_state, _a0)
-    img_np = np.array(scene_frame) / 255.0
-    up_wi  = np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
-
-    fig2, axes2 = plt.subplots(1, 3, figsize=(16, 4))
-    axes2[0].imshow(img_np); axes2[0].set_title('Start frame'); axes2[0].axis('off')
-    axes2[1].imshow(img_np)
-    axes2[1].imshow(up_wi, cmap='inferno', alpha=0.6, vmin=0, vmax=1)
-    axes2[1].set_title('Word x Image (BlurIG)'); axes2[1].axis('off')
-    _jw_n = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)
-    im = axes2[2].imshow(_jw_n, cmap='inferno', aspect='auto', vmin=0, vmax=1)
-    axes2[2].set_xticks(range(W)); axes2[2].set_xticklabels(plot_labels, rotation=40, ha='right', fontsize=8)
-    axes2[2].set_yticks(range(8)); axes2[2].set_yticklabels(JOINT_NAMES, fontsize=8)
-    axes2[2].set_title('Word x Joint (token IG)')
-    plt.colorbar(im, ax=axes2[2], fraction=0.03)
-    plt.suptitle(task + '  ep' + str(ep) + '  seed' + str(seed), fontsize=10)
+    # ── Row 2: BlurIG overlay per frame ───────────────────────────────────────
+    print('  BlurIG on 10 frames...')
+    fig2, axes2 = plt.subplots(1, 10, figsize=(20, 2))
+    for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
+        emb, state, am0 = _make_state(img_k)
+        wi_map = blurig_image(emb, state, am0)
+        img_np = np.array(img_k) / 255.0
+        axes2[k].imshow(img_np)
+        axes2[k].imshow(_upsample(wi_map), cmap='inferno', alpha=0.6, vmin=0, vmax=1)
+        axes2[k].set_title('start' if k == 0 else ('SUCCESS' if k == 9 else 'step ' + str(fd['step'])), fontsize=6)
+        axes2[k].axis('off')
+        print('   ', k + 1, '/ 10', end='\r', flush=True)
+    print()
+    fig2.suptitle('Word x Image (BlurIG) per frame', fontsize=9)
     plt.tight_layout()
-    ig_path = 'ig_ep' + str(ep).zfill(2) + '.png'
-    plt.savefig(ig_path, dpi=120, bbox_inches='tight')
+    ig_strip_path = 'ig_strip_ep' + str(ep).zfill(2) + '.png'
+    plt.savefig(ig_strip_path, dpi=120, bbox_inches='tight')
     plt.close()
-    display(IPyImage(ig_path))
+    display(IPyImage(ig_strip_path))
+
+    # ── Word x Joint (from first frame) ──────────────────────────────────────
+    print('  Word x Joint IG...')
+    emb0, state0, am0 = _make_state(frames_pil[0])
+    attr_jw = word_joint_ig(emb0, state0, am0)
+    _jw_n = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)
+    fig3, ax3 = plt.subplots(figsize=(max(10, W * 1.2), 3))
+    im = ax3.imshow(_jw_n, cmap='inferno', aspect='auto', vmin=0, vmax=1)
+    ax3.set_xticks(range(W)); ax3.set_xticklabels(plot_labels, rotation=40, ha='right', fontsize=8)
+    ax3.set_yticks(range(8)); ax3.set_yticklabels(JOINT_NAMES, fontsize=8)
+    ax3.set_title('Word x Joint (token IG, start frame)')
+    plt.colorbar(im, ax=ax3, fraction=0.03)
+    plt.tight_layout()
+    wj_path = 'wj_ep' + str(ep).zfill(2) + '.png'
+    plt.savefig(wj_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    display(IPyImage(wj_path))
     print()
 
 print('Done.')
