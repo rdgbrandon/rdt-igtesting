@@ -482,7 +482,7 @@ else:
     # Attribution-proportional alpha: low-signal regions stay transparent
     axes[1].imshow(img_np)
     _rgba = _mcm.get_cmap("inferno")(amap)
-    _rgba[..., 3] = np.clip(amap * 1.1, 0, 1)
+    _rgba[..., 3] = np.sqrt(amap) * 0.85
     axes[1].imshow(_rgba)
     axes[1].set_title("BlurIG overlay", fontsize=11)
 

@@ -118,12 +118,12 @@ def _upsample(wi_map):
     return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
 
 def _overlay_img(ax, img_np, wi_map):
-    """Overlay heatmap with attribution-proportional alpha.
-    Low-attribution regions stay transparent; only bright spots show color."""
+    """Overlay heatmap using sqrt-alpha so mid-range patches are visible
+    while near-zero regions stay transparent."""
     ax.imshow(img_np)
     up   = _upsample(wi_map)
     rgba = mcm.get_cmap('inferno')(up)        # (H, W, 4) RGBA
-    rgba[..., 3] = np.clip(up * 1.1, 0, 1)   # alpha ∝ attribution strength
+    rgba[..., 3] = np.sqrt(up) * 0.85        # sqrt: boosts mid-values; *0.85 keeps original visible
     ax.imshow(rgba)
 
 def _make_state(frame):
@@ -165,6 +165,7 @@ for info in success_frames:
     print('  BlurIG on 10 frames...')
     wi_means = []
     fig2, axes2 = plt.subplots(1, 10, figsize=(22, 3))
+    fig2.subplots_adjust(right=0.91, wspace=0.04)
     for k, img_k in enumerate(frames_pil):
         emb, state, am0 = _make_state(img_k)
         wi_map = blurig_image(emb, state, am0)
@@ -176,12 +177,12 @@ for info in success_frames:
         axes2[k].axis('off')
         print('   ', k + 1, '/ 10', end='\r', flush=True)
     print()
+    # Colorbar in its own axes — avoid stealing space from frame panels
+    cax2 = fig2.add_axes([0.92, 0.12, 0.012, 0.72])
     sm = plt.cm.ScalarMappable(cmap='inferno', norm=plt.Normalize(0, 1))
-    fig2.colorbar(sm, ax=axes2.ravel().tolist(), shrink=0.75, pad=0.01,
-                  label='Attribution strength')
+    fig2.colorbar(sm, cax=cax2, label='Attribution strength')
     fig2.suptitle('BlurIG image attribution per frame  |  ' + task +
                   '  ep' + str(ep), fontsize=10, y=1.02)
-    plt.tight_layout()
     ig_strip_path = 'ig_strip_ep' + str(ep).zfill(2) + '.png'
     plt.savefig(ig_strip_path, dpi=140, bbox_inches='tight')
     plt.close()
