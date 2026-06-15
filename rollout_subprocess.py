@@ -183,4 +183,4 @@ n_found = len(success_meta)
 print(f"\nSuccess rate: {n_found}/{ep}  ({100*n_found/max(ep,1):.0f}%)", flush=True)
 with open('success_frames.json', 'w') as f:
     json.dump({'task': args.task, 'base_seed': args.base_seed, 'successes': success_meta}, f)
-print(f"Saved {n} success episodes (10 frames each) + success_frames.json", flush=True)
+print(f"Saved {n_found} success episodes (10 frames each) + success_frames.json", flush=True)
