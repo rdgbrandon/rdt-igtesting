@@ -466,17 +466,40 @@ else:
 
     attr   = feature_blur_ig(single_emb)
     img_np = np.array(frame_pil) / 255.0
-    amap   = to_map(attr, frame_pil.height, frame_pil.width)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
-    axes[0].imshow(img_np);                                                                    axes[0].set_title("ManiSkill frame", fontsize=11)
-    axes[1].imshow(img_np); axes[1].imshow(amap, cmap="inferno", alpha=0.6, vmin=0, vmax=1); axes[1].set_title("BlurIG overlay", fontsize=11)
-    axes[2].imshow(amap, cmap="inferno", vmin=0, vmax=1);                                     axes[2].set_title("BlurIG — gripper attribution", fontsize=11)
-    for ax in axes: ax.axis("off")
+    # Raw 27×27 patch grid (before bilinear upsampling)
+    a_np     = attr.squeeze(0).float().cpu().detach().numpy()
+    raw_grid = np.abs(a_np).sum(-1).reshape(grid_size, grid_size)
+    raw_grid = (raw_grid - raw_grid.min()) / (raw_grid.max() - raw_grid.min() + 1e-8)
+    amap     = to_map(attr, frame_pil.height, frame_pil.width)
+
+    import matplotlib.cm as _mcm
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.5))
+
+    axes[0].imshow(img_np)
+    axes[0].set_title("ManiSkill frame", fontsize=11)
+
+    # Attribution-proportional alpha: low-signal regions stay transparent
+    axes[1].imshow(img_np)
+    _rgba = _mcm.get_cmap("inferno")(amap)
+    _rgba[..., 3] = np.clip(amap * 1.1, 0, 1)
+    axes[1].imshow(_rgba)
+    axes[1].set_title("BlurIG overlay", fontsize=11)
+
+    axes[2].imshow(amap, cmap="inferno", vmin=0, vmax=1)
+    axes[2].set_title("BlurIG — gripper attribution", fontsize=11)
+
+    # Raw patch grid at native 27×27 resolution
+    im4 = axes[3].imshow(raw_grid, cmap="inferno", vmin=0, vmax=1, interpolation="nearest")
+    axes[3].set_title(f"Patch grid  ({grid_size}×{grid_size})", fontsize=11)
+    fig.colorbar(im4, ax=axes[3], fraction=0.046, pad=0.04)
+
+    for ax in axes[:3]:
+        ax.axis("off")
     fig.suptitle(
         f"RDT-1B  —  feature-level BlurIG  |  Task: {TASK} ({TASK_TEXT})\n"
         f"Score: gripper over first {SCORE_HORIZON} steps  |  "
-        f"Patch grid: {grid_size}x{grid_size}  |  "
+        f"Patch grid: {grid_size}×{grid_size}  |  "
         f"BlurIG steps: {N_BLURIG_STEPS}  DDPM steps: {N_DDPM_STEPS}",
         fontsize=9,
     )

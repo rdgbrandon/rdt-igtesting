@@ -1,6 +1,8 @@
 import json, os
 import torch, numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as mcm
+import torchvision.transforms.functional as TF
 from PIL import Image as PILImage
 from IPython.display import display, Image as IPyImage
 from transformers import AutoTokenizer
@@ -23,7 +25,6 @@ task2lang = {
     'PlugCharger-v1':      'Pick up one of the misplaced shapes and insert it into the correct slot.',
 }
 
-# Load lang_tokens from saved embed file
 _embed_path = 'lang_embed_' + task + '.pt'
 _ld = torch.load(_embed_path, map_location='cpu', weights_only=False)
 _lt = _ld if not isinstance(_ld, dict) else _ld['embeddings']
@@ -56,18 +57,23 @@ _bl   = torch.zeros_like(lang_tokens)
 _dl   = lang_tokens - _bl
 N_IG  = 15
 
+
 def _blur_emb(e, sigma):
-    import torch.nn.functional as F
+    """Gaussian blur in SigLIP patch-embedding space.
+    Uses TF.gaussian_blur (reflect-padded) to avoid zero-pad boundary artifacts."""
     B, T, C = e.shape; G = int(T ** 0.5)
-    m = e.reshape(B, G, G, C).permute(0, 3, 1, 2)
-    if sigma > 0:
-        ks = max(3, int(6 * sigma) // 2 * 2 + 1)
-        m = F.avg_pool2d(m, kernel_size=ks, stride=1, padding=ks // 2)
-    return m.permute(0, 2, 3, 1).reshape(B, T, C)
+    img = e.reshape(B, G, G, C).permute(0, 3, 1, 2).float()
+    if sigma >= 0.05:
+        ks = 2 * int(3 * sigma + 0.5) + 1
+        if ks % 2 == 0: ks += 1
+        img = TF.gaussian_blur(img, kernel_size=[ks, ks], sigma=sigma)
+    return img.to(e.dtype).permute(0, 2, 3, 1).reshape(B, T, C)
+
 
 def blurig_image(scene_emb, scene_state, am0):
-    """BlurIG: overall image attribution map (summed over all actions/joints)."""
-    sigmas = [10.0, 7.5, 5.0, 2.5, 0.0]
+    """BlurIG: overall image attribution map (summed over all actions/joints).
+    sigma range matches rdt_blurig.py (2.0 → 0.0) to avoid extreme blurring."""
+    sigmas = [2.0, 1.5, 1.0, 0.5, 0.0]
     wi_tot = torch.zeros_like(scene_emb)
     for k in range(len(sigmas) - 1):
         E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
@@ -84,6 +90,7 @@ def blurig_image(scene_emb, scene_state, am0):
     wi_map = wi_tot.squeeze(0).float().cpu().abs().sum(-1).reshape(G, G).numpy()
     wi_map = (wi_map - wi_map.min()) / (wi_map.max() - wi_map.min() + 1e-8)
     return wi_map
+
 
 def word_joint_ig(scene_emb, scene_state, am0):
     """Token IG: word x joint attribution."""
@@ -104,10 +111,20 @@ def word_joint_ig(scene_emb, scene_state, am0):
     attr_jw = np.array([[attr_jt[j, g].sum() for g in groups] for j in range(8)])
     return attr_jw
 
+
 _bil = getattr(PILImage, 'Resampling', PILImage).BILINEAR
 
 def _upsample(wi_map):
     return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
+
+def _overlay_img(ax, img_np, wi_map):
+    """Overlay heatmap with attribution-proportional alpha.
+    Low-attribution regions stay transparent; only bright spots show color."""
+    ax.imshow(img_np)
+    up   = _upsample(wi_map)
+    rgba = mcm.get_cmap('inferno')(up)        # (H, W, 4) RGBA
+    rgba[..., 3] = np.clip(up * 1.1, 0, 1)   # alpha ∝ attribution strength
+    ax.imshow(rgba)
 
 def _make_state(frame):
     with torch.no_grad():
@@ -118,59 +135,101 @@ def _make_state(frame):
         state = rdt.state_adaptor(torch.cat([_s0, _a0], dim=2))
     return emb, state, _a0
 
+
 for info in success_frames:
     ep, seed, steps, flist = info['ep'], info['seed'], info['steps'], info['frames']
     print('Episode', ep, 'seed=', seed, 'steps=', steps)
 
-    frames_pil = [PILImage.open(fd['path']).convert('RGB') for fd in flist]
+    frames_pil  = [PILImage.open(fd['path']).convert('RGB') for fd in flist]
+    step_labels = (['start']
+                   + ['step ' + str(flist[k]['step']) for k in range(1, 9)]
+                   + ['SUCCESS'])
 
     # ── Row 1: raw frames ─────────────────────────────────────────────────────
-    fig1, axes1 = plt.subplots(1, 10, figsize=(20, 2))
-    for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
+    fig1, axes1 = plt.subplots(1, 10, figsize=(22, 3))
+    for k, img_k in enumerate(frames_pil):
         axes1[k].imshow(np.array(img_k))
-        axes1[k].set_title('start' if k == 0 else ('SUCCESS' if k == 9 else 'step ' + str(fd['step'])), fontsize=6)
+        axes1[k].set_title(step_labels[k], fontsize=7,
+                           fontweight='bold' if k in (0, 9) else 'normal',
+                           color='green' if k == 9 else 'black')
         axes1[k].axis('off')
-    fig1.suptitle(task + '  ep' + str(ep) + '  seed' + str(seed) + '  (' + str(steps) + ' steps)', fontsize=9)
+    fig1.suptitle(task + '  ep' + str(ep) + '  seed' + str(seed) +
+                  '  (' + str(steps) + ' steps)', fontsize=10, y=1.02)
     plt.tight_layout()
     strip_path = 'strip_ep' + str(ep).zfill(2) + '.png'
-    plt.savefig(strip_path, dpi=120, bbox_inches='tight')
+    plt.savefig(strip_path, dpi=140, bbox_inches='tight')
     plt.close()
     display(IPyImage(strip_path))
 
     # ── Row 2: BlurIG overlay per frame ───────────────────────────────────────
     print('  BlurIG on 10 frames...')
-    fig2, axes2 = plt.subplots(1, 10, figsize=(20, 2))
-    for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
+    wi_means = []
+    fig2, axes2 = plt.subplots(1, 10, figsize=(22, 3))
+    for k, img_k in enumerate(frames_pil):
         emb, state, am0 = _make_state(img_k)
         wi_map = blurig_image(emb, state, am0)
-        img_np = np.array(img_k) / 255.0
-        axes2[k].imshow(img_np)
-        axes2[k].imshow(_upsample(wi_map), cmap='inferno', alpha=0.6, vmin=0, vmax=1)
-        axes2[k].set_title('start' if k == 0 else ('SUCCESS' if k == 9 else 'step ' + str(fd['step'])), fontsize=6)
+        wi_means.append(float(wi_map.mean()))
+        _overlay_img(axes2[k], np.array(img_k) / 255.0, wi_map)
+        axes2[k].set_title(step_labels[k], fontsize=7,
+                           fontweight='bold' if k in (0, 9) else 'normal',
+                           color='green' if k == 9 else 'black')
         axes2[k].axis('off')
         print('   ', k + 1, '/ 10', end='\r', flush=True)
     print()
-    fig2.suptitle('Word x Image (BlurIG) per frame', fontsize=9)
+    sm = plt.cm.ScalarMappable(cmap='inferno', norm=plt.Normalize(0, 1))
+    fig2.colorbar(sm, ax=axes2.ravel().tolist(), shrink=0.75, pad=0.01,
+                  label='Attribution strength')
+    fig2.suptitle('BlurIG image attribution per frame  |  ' + task +
+                  '  ep' + str(ep), fontsize=10, y=1.02)
     plt.tight_layout()
     ig_strip_path = 'ig_strip_ep' + str(ep).zfill(2) + '.png'
-    plt.savefig(ig_strip_path, dpi=120, bbox_inches='tight')
+    plt.savefig(ig_strip_path, dpi=140, bbox_inches='tight')
     plt.close()
     display(IPyImage(ig_strip_path))
+
+    # ── Temporal attribution evolution ────────────────────────────────────────
+    fig_t, ax_t = plt.subplots(figsize=(8, 2.5))
+    ax_t.plot(range(10), wi_means, 'o-', color='darkorange', linewidth=2, markersize=6)
+    ax_t.set_xticks(range(10))
+    ax_t.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
+    ax_t.set_ylabel('Mean attribution', fontsize=9)
+    ax_t.set_title('Attribution magnitude over episode  (ep' + str(ep) + ')', fontsize=9)
+    ax_t.grid(True, alpha=0.3)
+    plt.tight_layout()
+    t_path = 'attr_temporal_ep' + str(ep).zfill(2) + '.png'
+    plt.savefig(t_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    display(IPyImage(t_path))
 
     # ── Word x Joint (from first frame) ──────────────────────────────────────
     print('  Word x Joint IG...')
     emb0, state0, am0 = _make_state(frames_pil[0])
-    attr_jw = word_joint_ig(emb0, state0, am0)
-    _jw_n = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)
-    fig3, ax3 = plt.subplots(figsize=(max(10, W * 1.2), 3))
-    im = ax3.imshow(_jw_n, cmap='inferno', aspect='auto', vmin=0, vmax=1)
-    ax3.set_xticks(range(W)); ax3.set_xticklabels(plot_labels, rotation=40, ha='right', fontsize=8)
-    ax3.set_yticks(range(8)); ax3.set_yticklabels(JOINT_NAMES, fontsize=8)
-    ax3.set_title('Word x Joint (token IG, start frame)')
-    plt.colorbar(im, ax=ax3, fraction=0.03)
-    plt.tight_layout()
+    attr_jw  = word_joint_ig(emb0, state0, am0)
+    _jw_row  = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)   # per-joint norm
+    _jw_glob = attr_jw / (attr_jw.max() + 1e-8)                         # global norm
+
+    fig3, (ax3a, ax3b) = plt.subplots(2, 1, figsize=(max(14, W * 1.4), 7),
+                                       gridspec_kw={'hspace': 0.6})
+    for ax, data, title in [
+        (ax3a, _jw_row,  'Row-normalised  — which words each joint cares about'),
+        (ax3b, _jw_glob, 'Global-normalised  — cross-joint magnitude comparison'),
+    ]:
+        im = ax.imshow(data, cmap='inferno', aspect='auto', vmin=0, vmax=1)
+        ax.set_xticks(range(W))
+        ax.set_xticklabels(plot_labels, rotation=45, ha='right', fontsize=8)
+        ax.set_yticks(range(8))
+        ax.set_yticklabels(JOINT_NAMES, fontsize=9)
+        ax.set_title(title, fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+        for idx in np.argsort(data.ravel())[-5:][::-1]:
+            r, c = divmod(int(idx), W)
+            ax.text(c, r, f'{data[r, c]:.2f}', ha='center', va='center',
+                    fontsize=6, color='white', fontweight='bold')
+
+    fig3.suptitle('Word × Joint attribution  |  ' + task +
+                  '  ep' + str(ep) + '  (start frame)', fontsize=10)
     wj_path = 'wj_ep' + str(ep).zfill(2) + '.png'
-    plt.savefig(wj_path, dpi=120, bbox_inches='tight')
+    plt.savefig(wj_path, dpi=130, bbox_inches='tight')
     plt.close()
     display(IPyImage(wj_path))
     print()
