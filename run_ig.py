@@ -92,6 +92,27 @@ def blurig_image(scene_emb, scene_state, am0):
     return wi_map
 
 
+def per_joint_image_ig(scene_emb, scene_state, am0):
+    """BlurIG per joint: how much each joint's predicted action depends on the image.
+    Uses 2 blur steps (fast) with 8 backward passes per step.
+    Returns shape (8,) — total attribution magnitude per joint."""
+    sigmas = [2.0, 1.0, 0.0]
+    joint_totals = [torch.zeros_like(scene_emb) for _ in range(8)]
+    for k in range(len(sigmas) - 1):
+        E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
+        E_next = _blur_emb(scene_emb.detach(), sigmas[k + 1])
+        with torch.enable_grad():
+            _ac = rdt.conditional_sample(
+                rdt.lang_adaptor(lang_tokens), lang_attn_mask,
+                rdt.img_adaptor(E_t.repeat(1, 6, 1)),
+                scene_state, am0, ctrl_freqs)
+        js = _ac[:, :8, :][:, :, _midx].norm(dim=(0, 1))   # (8,) per-joint score
+        for j in range(8):
+            g = torch.autograd.grad(js[j], E_t, retain_graph=(j < 7))[0]
+            joint_totals[j] = joint_totals[j] + g.detach() * (E_next - E_t.detach())
+    return np.array([joint_totals[j].abs().sum().item() for j in range(8)])
+
+
 def word_joint_ig(scene_emb, scene_state, am0):
     """Token IG: word x joint attribution."""
     wj = [torch.zeros_like(lang_tokens) for _ in range(8)]
@@ -165,10 +186,14 @@ for info in success_frames:
     # ── Row 2: BlurIG overlay per frame ───────────────────────────────────────
     print('  BlurIG on 10 frames...')
     wi_means = []
+    _cached_embs, _cached_states, _cached_ams = [], [], []   # reused for per-joint IG
     fig2, axes2 = plt.subplots(1, 10, figsize=(22, 3))
     fig2.subplots_adjust(right=0.91, wspace=0.04)
     for k, img_k in enumerate(frames_pil):
         emb, state, am0 = _make_state(img_k)
+        _cached_embs.append(emb)
+        _cached_states.append(state)
+        _cached_ams.append(am0)
         wi_map = blurig_image(emb, state, am0)
         wi_means.append(float(wi_map.mean()))
         _overlay_img(axes2[k], np.array(img_k) / 255.0, wi_map)
@@ -202,6 +227,44 @@ for info in success_frames:
     plt.savefig(t_path, dpi=120, bbox_inches='tight')
     plt.close()
     display(IPyImage(t_path))
+
+    # ── Per-joint image attribution over time ────────────────────────────────
+    print('  Per-joint image IG across 10 frames...')
+    joint_attr_rows = []
+    for k in range(10):
+        ja = per_joint_image_ig(_cached_embs[k], _cached_states[k], _cached_ams[k])
+        joint_attr_rows.append(ja)
+        print(f'   {k+1}/10', end='\r', flush=True)
+    print()
+    ja_mat  = np.array(joint_attr_rows)                                        # (10, 8)
+    ja_norm = ja_mat / (ja_mat.max(axis=0, keepdims=True) + 1e-8)             # per-joint norm
+
+    fig_j, (ax_ja, ax_jb) = plt.subplots(2, 1, figsize=(12, 5),
+                                           gridspec_kw={'hspace': 0.6})
+    im_ja = ax_ja.imshow(ja_norm.T, cmap='inferno', aspect='auto', vmin=0, vmax=1)
+    ax_ja.set_xticks(range(10))
+    ax_ja.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
+    ax_ja.set_yticks(range(8))
+    ax_ja.set_yticklabels(JOINT_NAMES, fontsize=9)
+    ax_ja.set_title('Per-joint image attribution  (each joint normalised to its own max)', fontsize=9)
+    fig_j.colorbar(im_ja, ax=ax_ja, fraction=0.03, pad=0.02)
+
+    cmap_lines = plt.cm.tab10
+    for j in range(8):
+        ax_jb.plot(range(10), ja_norm[:, j], 'o-', label=JOINT_NAMES[j],
+                   color=cmap_lines(j / 10), linewidth=1.5, markersize=4)
+    ax_jb.set_xticks(range(10))
+    ax_jb.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
+    ax_jb.set_ylabel('Normalised attribution', fontsize=9)
+    ax_jb.set_title('Per-joint image attribution over time', fontsize=9)
+    ax_jb.legend(fontsize=7, ncol=4, loc='upper right')
+    ax_jb.grid(True, alpha=0.3)
+
+    fig_j.suptitle('Joint image attribution  |  ' + task + '  ep' + str(ep), fontsize=10)
+    joint_path = 'joint_temporal_ep' + str(ep).zfill(2) + '.png'
+    plt.savefig(joint_path, dpi=130, bbox_inches='tight')
+    plt.close()
+    display(IPyImage(joint_path))
 
     # ── Word x Joint (from first frame) ──────────────────────────────────────
     print('  Word x Joint IG...')
