@@ -118,12 +118,13 @@ def _upsample(wi_map):
     return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
 
 def _overlay_img(ax, img_np, wi_map):
-    """Overlay heatmap using sqrt-alpha so mid-range patches are visible
-    while near-zero regions stay transparent."""
+    """Overlay heatmap resized to match img_np exactly so pixels align.
+    Uses sqrt-alpha so mid-range patches are visible while near-zero stays transparent."""
+    h, w = img_np.shape[:2]
     ax.imshow(img_np)
-    up   = _upsample(wi_map)
+    up = np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((w, h), _bil)) / 255.0
     rgba = mcm.get_cmap('inferno')(up)        # (H, W, 4) RGBA
-    rgba[..., 3] = np.sqrt(up) * 0.85        # sqrt: boosts mid-values; *0.85 keeps original visible
+    rgba[..., 3] = np.sqrt(up) * 0.85
     ax.imshow(rgba)
 
 def _make_state(frame):
