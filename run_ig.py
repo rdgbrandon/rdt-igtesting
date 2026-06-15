@@ -135,6 +135,44 @@ def word_joint_ig(scene_emb, scene_state, am0):
 
 _bil = getattr(PILImage, 'Resampling', PILImage).BILINEAR
 
+def _draw_arm_on_ax(ax):
+    """Draw a simplified Franka Panda arm schematic on ax, matching JOINT_NAMES row order."""
+    ax.set_xlim(0, 1); ax.set_ylim(-0.10, 1.06); ax.axis('off')
+    ax.set_title('Panda arm\njoint reference', fontsize=9, pad=4)
+
+    # (x, y) positions — side-view, base at bottom, gripper at top
+    px = [0.46, 0.46, 0.46, 0.56, 0.56, 0.56, 0.56, 0.56]
+    py = [0.04, 0.17, 0.31, 0.45, 0.58, 0.70, 0.82, 0.94]
+
+    # Base platform
+    ax.add_patch(plt.Rectangle((0.20, -0.08), 0.52, 0.05, color='#333', zorder=0))
+    ax.fill_between([0.20, 0.72], [-0.03, -0.03], [0.02, 0.02], color='#555', zorder=0)
+
+    # Arm links — thick grey + light highlight for depth
+    for lw, col in [(11, '#666'), (6, '#bbb')]:
+        ax.plot(px, py, color=col, linewidth=lw, solid_capstyle='round',
+                solid_joinstyle='round', zorder=1)
+
+    # Gripper fingers
+    tx, ty = px[-1], py[-1]
+    for dx in [-0.07, 0.07]:
+        ax.plot([tx + dx, tx + dx], [ty, ty + 0.07], color='#666', linewidth=7,
+                solid_capstyle='round', zorder=1)
+        ax.plot([tx + dx, tx + dx], [ty, ty + 0.07], color='#bbb', linewidth=3,
+                solid_capstyle='round', zorder=1)
+
+    colors = plt.cm.tab10(np.arange(8) / 10)
+    labels = ['base rot', 'shoulder', 'upper arm', 'elbow',
+              'forearm rot', 'wrist pitch', 'wrist rot', 'gripper']
+    suffixes = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'J7', 'G']
+
+    for i, (x, y) in enumerate(zip(px, py)):
+        ax.scatter(x, y, s=200, color=colors[i], zorder=3,
+                   edgecolors='black', linewidths=1.2)
+        ax.text(x + 0.10, y, f'{suffixes[i]}  {labels[i]}',
+                fontsize=8, va='center', ha='left',
+                color=colors[i], fontweight='bold')
+
 def _upsample(wi_map):
     return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
 
@@ -246,6 +284,8 @@ for info in success_frames:
     ax_ja.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
     ax_ja.set_yticks(range(8))
     ax_ja.set_yticklabels(JOINT_NAMES, fontsize=9)
+    for ytick, col in zip(ax_ja.get_yticklabels(), plt.cm.tab10(np.arange(8) / 10)):
+        ytick.set_color(col)
     ax_ja.set_title('Per-joint image attribution  (each joint normalised to its own max)', fontsize=9)
     fig_j.colorbar(im_ja, ax=ax_ja, fraction=0.03, pad=0.02)
 
@@ -273,8 +313,16 @@ for info in success_frames:
     _jw_row  = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)   # per-joint norm
     _jw_glob = attr_jw / (attr_jw.max() + 1e-8)                         # global norm
 
-    fig3, (ax3a, ax3b) = plt.subplots(2, 1, figsize=(max(14, W * 1.4), 7),
-                                       gridspec_kw={'hspace': 0.6})
+    fig_w = max(14, W * 1.4)
+    fig3  = plt.figure(figsize=(fig_w + 4, 7))
+    gs    = fig3.add_gridspec(2, 2, width_ratios=[3.2, fig_w],
+                              hspace=0.55, wspace=0.06)
+    ax_arm = fig3.add_subplot(gs[:, 0])   # arm diagram spans both rows
+    ax3a   = fig3.add_subplot(gs[0, 1])
+    ax3b   = fig3.add_subplot(gs[1, 1])
+
+    _draw_arm_on_ax(ax_arm)
+
     for ax, data, title in [
         (ax3a, _jw_row,  'Row-normalised  — which words each joint cares about'),
         (ax3b, _jw_glob, 'Global-normalised  — cross-joint magnitude comparison'),
@@ -284,6 +332,9 @@ for info in success_frames:
         ax.set_xticklabels(plot_labels, rotation=45, ha='right', fontsize=8)
         ax.set_yticks(range(8))
         ax.set_yticklabels(JOINT_NAMES, fontsize=9)
+        # Color-match y-tick labels to the arm diagram dots
+        for ytick, col in zip(ax.get_yticklabels(), plt.cm.tab10(np.arange(8) / 10)):
+            ytick.set_color(col)
         ax.set_title(title, fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
         for idx in np.argsort(data.ravel())[-5:][::-1]:
