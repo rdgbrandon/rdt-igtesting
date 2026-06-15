@@ -16,9 +16,10 @@ sys.path.insert(0, '/content/RoboticsDiffusionTransformer')
 os.chdir('/content/rdt-igtesting')
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--task',      default='PickCube-v1')
-parser.add_argument('--n',         type=int, default=25)
-parser.add_argument('--base-seed', type=int, default=20241201)
+parser.add_argument('--task',         default='PickCube-v1')
+parser.add_argument('--n',            type=int, default=1,   help='number of successes to collect')
+parser.add_argument('--max-attempts', type=int, default=500, help='episode cap to avoid infinite loop')
+parser.add_argument('--base-seed',    type=int, default=20241201)
 args = parser.parse_args()
 
 os.environ['MANISKILL_TASK'] = args.task
@@ -164,18 +165,22 @@ def rollout(ep_idx):
 
 
 import json
-print(f"\n{'ep':>4}  {'seed':>10}  {'result':>10}  {'steps':>6}", flush=True)
+print(f"Target: {args.n} success(es)  |  max attempts: {args.max_attempts}", flush=True)
+print(f"\n{'ep':>4}  {'seed':>10}  {'result':>10}  {'steps':>6}  {'found':>6}", flush=True)
 results, success_meta = [], []
-for ep in range(args.n):
+ep = 0
+while len(success_meta) < args.n and ep < args.max_attempts:
     s, t, frame_paths = rollout(ep)
     results.append(s)
     if s:
         success_meta.append({'ep': ep, 'seed': ep + args.base_seed,
                              'steps': t, 'frames': frame_paths})
-    print(f"  {ep:2d}  {ep+args.base_seed:10d}    {'SUCCESS' if s else 'fail   '} ({t:4d})", flush=True)
+    print(f"  {ep:2d}  {ep+args.base_seed:10d}    {'SUCCESS' if s else 'fail   '} ({t:4d})"
+          f"  {len(success_meta)}/{args.n}", flush=True)
+    ep += 1
 
-n = sum(results)
-print(f"\nSuccess rate: {n}/{args.n}  ({100*n/args.n:.0f}%)", flush=True)
+n_found = len(success_meta)
+print(f"\nSuccess rate: {n_found}/{ep}  ({100*n_found/max(ep,1):.0f}%)", flush=True)
 with open('success_frames.json', 'w') as f:
     json.dump({'task': args.task, 'base_seed': args.base_seed, 'successes': success_meta}, f)
 print(f"Saved {n} success episodes (10 frames each) + success_frames.json", flush=True)

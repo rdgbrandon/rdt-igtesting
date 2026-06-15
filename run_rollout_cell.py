@@ -1,6 +1,6 @@
 import subprocess, sys, random, os
 
-def run(task='PickCube-v1', n=25):
+def run(task='PickCube-v1', n=1):
     base_seed = random.randint(0, 99999)
     print('base_seed:', base_seed)
     proc = subprocess.Popen(
