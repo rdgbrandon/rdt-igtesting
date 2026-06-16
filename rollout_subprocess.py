@@ -30,8 +30,15 @@ except (ImportError, ModuleNotFoundError):
         print(r.stdout[-3000:], flush=True)
         print(r.stderr[-3000:], flush=True)
         raise RuntimeError('mani-skill reinstall failed — see pip output above')
-    print('WORKER: Reinstalled mani-skill — restarting worker...', flush=True)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Refresh import state in this process instead of re-exec'ing — simpler and
+    # avoids any chance of the process restart being mishandled by the parent.
+    for _m in list(sys.modules):
+        if _m == 'mani_skill' or _m.startswith('mani_skill.'):
+            del sys.modules[_m]
+    import importlib
+    importlib.invalidate_caches()
+    import mani_skill.utils
+    print('WORKER: mani_skill fixed in-place — continuing...', flush=True)
 
 os.environ.setdefault('DISPLAY', '')
 os.environ.setdefault('MUJOCO_GL', 'egl')
