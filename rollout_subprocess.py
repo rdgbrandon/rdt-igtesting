@@ -6,37 +6,48 @@ Usage: python rollout_subprocess.py [--task TASK] [--n N] [--base-seed SEED]
 """
 import os, sys, subprocess, argparse
 
-# Self-healing: mani_skill can silently lose its utils subpackage between Colab sessions.
-# Root cause (confirmed): mani_skill.utils.common does `import sapien.physx`, and sapien
-# (mani_skill's physics/rendering engine dependency) can go missing independently of
-# mani_skill itself. Reinstalling ONLY mani-skill with --no-deps never fixes that —
-# sapien must be reinstalled too. Detect here (fresh subprocess), reinstall both, and
-# retry the import so the rest of the script sees a clean installation.
+# Self-healing: mani_skill can silently lose parts of its dependency chain between
+# Colab sessions. Root cause (confirmed): mani_skill.utils.common imports sapien, and
+# sapien itself pulls in things like transforms3d. Multiple deps in this chain have
+# been found missing one at a time (sapien, then transforms3d) — --no-deps reinstalls
+# of just the top package never catch these. Two-phase fix:
+#   Phase 1: --force-reinstall --no-deps mani-skill + sapien (fast — fixes their OWN
+#            corrupted/missing files without touching dependencies).
+#   Phase 2: plain `pip install` (no --force-reinstall, no --no-deps) of the same two
+#            packages — resolves their FULL dependency tree, but pip skips anything
+#            already satisfied almost instantly (torch etc. untouched) and only
+#            installs whatever's genuinely missing (transforms3d, stragglers).
 try:
     import mani_skill.utils
 except (ImportError, ModuleNotFoundError):
     print('WORKER: mani_skill.utils missing — diagnosing...', flush=True)
-    for pkg in ['sapien', 'mani-skill']:
-        print(f'WORKER: reinstalling {pkg}...', flush=True)
-        # --no-cache-dir: force a fresh download instead of reusing a possibly-corrupted
-        # local pip cache. --no-deps on each avoids dragging in the full dependency tree
-        # (torch etc.), which is what made a plain --force-reinstall mani-skill slow.
-        # timeout=180: avoid hanging forever if PyPI is unreachable from this VM.
-        try:
-            r = subprocess.run([sys.executable, '-m', 'pip', 'install',
-                                '--force-reinstall', '--no-deps', '--no-cache-dir', pkg],
-                               capture_output=True, text=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f'WORKER: {pkg} install timed out after 180s — likely a network issue '
-                'reaching PyPI from this Colab VM. Try a fresh runtime.'
-            )
-        if r.returncode != 0:
-            print(f'WORKER: {pkg} reinstall FAILED:', flush=True)
-            print(r.stdout[-3000:], flush=True)
-            print(r.stderr[-3000:], flush=True)
-            raise RuntimeError(f'{pkg} reinstall failed — see pip output above')
-        print(f'WORKER: {pkg} reinstalled OK.', flush=True)
+
+    print('WORKER: Phase 1 — force-reinstalling mani-skill + sapien (files only)...', flush=True)
+    try:
+        r1 = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '--force-reinstall',
+             '--no-deps', '--no-cache-dir', 'mani-skill', 'sapien'],
+            capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('WORKER: Phase 1 install timed out after 180s — network issue reaching PyPI.')
+    if r1.returncode != 0:
+        print('WORKER: Phase 1 FAILED:', flush=True)
+        print(r1.stdout[-2000:], flush=True); print(r1.stderr[-2000:], flush=True)
+        raise RuntimeError('Phase 1 install failed — see pip output above')
+    print('WORKER: Phase 1 OK.', flush=True)
+
+    print('WORKER: Phase 2 — filling in missing dependencies...', flush=True)
+    try:
+        r2 = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '--no-cache-dir', 'mani-skill', 'sapien'],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('WORKER: Phase 2 install timed out after 300s — network issue reaching PyPI.')
+    if r2.returncode != 0:
+        print('WORKER: Phase 2 FAILED:', flush=True)
+        print(r2.stdout[-2000:], flush=True); print(r2.stderr[-2000:], flush=True)
+        raise RuntimeError('Phase 2 install failed — see pip output above')
+    print('WORKER: Phase 2 OK.', flush=True)
 
     # Refresh import state in this process instead of re-exec'ing — simpler and
     # avoids any chance of the process restart being mishandled by the parent.
