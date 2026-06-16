@@ -7,33 +7,42 @@ Usage: python rollout_subprocess.py [--task TASK] [--n N] [--base-seed SEED]
 import os, sys, subprocess, argparse
 
 # Self-healing: mani_skill can silently lose its utils subpackage between Colab sessions.
-# Detect it here (fresh subprocess), reinstall, and re-exec so the rest of the script
-# sees a clean installation without requiring any user action.
+# Root cause (confirmed): mani_skill.utils.common does `import sapien.physx`, and sapien
+# (mani_skill's physics/rendering engine dependency) can go missing independently of
+# mani_skill itself. Reinstalling ONLY mani-skill with --no-deps never fixes that —
+# sapien must be reinstalled too. Detect here (fresh subprocess), reinstall both, and
+# retry the import so the rest of the script sees a clean installation.
 try:
     import mani_skill.utils
 except (ImportError, ModuleNotFoundError):
-    print('WORKER: mani_skill.utils missing — force-reinstalling...', flush=True)
-    # --no-cache-dir: force a fresh download instead of reusing a possibly-corrupted
-    # local pip cache, which is why a plain --force-reinstall can silently not fix it.
-    # timeout=180: avoid hanging forever if PyPI is unreachable from this VM.
-    try:
-        r = subprocess.run([sys.executable, '-m', 'pip', 'install',
-                            '--force-reinstall', '--no-deps', '--no-cache-dir', 'mani-skill'],
-                           capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            'WORKER: pip install timed out after 180s — likely a network issue '
-            'reaching PyPI from this Colab VM. Try a fresh runtime.'
-        )
-    if r.returncode != 0:
-        print('WORKER: reinstall FAILED:', flush=True)
-        print(r.stdout[-3000:], flush=True)
-        print(r.stderr[-3000:], flush=True)
-        raise RuntimeError('mani-skill reinstall failed — see pip output above')
+    print('WORKER: mani_skill.utils missing — diagnosing...', flush=True)
+    for pkg in ['sapien', 'mani-skill']:
+        print(f'WORKER: reinstalling {pkg}...', flush=True)
+        # --no-cache-dir: force a fresh download instead of reusing a possibly-corrupted
+        # local pip cache. --no-deps on each avoids dragging in the full dependency tree
+        # (torch etc.), which is what made a plain --force-reinstall mani-skill slow.
+        # timeout=180: avoid hanging forever if PyPI is unreachable from this VM.
+        try:
+            r = subprocess.run([sys.executable, '-m', 'pip', 'install',
+                                '--force-reinstall', '--no-deps', '--no-cache-dir', pkg],
+                               capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f'WORKER: {pkg} install timed out after 180s — likely a network issue '
+                'reaching PyPI from this Colab VM. Try a fresh runtime.'
+            )
+        if r.returncode != 0:
+            print(f'WORKER: {pkg} reinstall FAILED:', flush=True)
+            print(r.stdout[-3000:], flush=True)
+            print(r.stderr[-3000:], flush=True)
+            raise RuntimeError(f'{pkg} reinstall failed — see pip output above')
+        print(f'WORKER: {pkg} reinstalled OK.', flush=True)
+
     # Refresh import state in this process instead of re-exec'ing — simpler and
     # avoids any chance of the process restart being mishandled by the parent.
     for _m in list(sys.modules):
-        if _m == 'mani_skill' or _m.startswith('mani_skill.'):
+        if _m == 'mani_skill' or _m.startswith('mani_skill.') \
+           or _m == 'sapien' or _m.startswith('sapien.'):
             del sys.modules[_m]
     import importlib
     importlib.invalidate_caches()
