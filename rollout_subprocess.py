@@ -15,9 +15,16 @@ except (ImportError, ModuleNotFoundError):
     print('WORKER: mani_skill.utils missing — force-reinstalling...', flush=True)
     # --no-cache-dir: force a fresh download instead of reusing a possibly-corrupted
     # local pip cache, which is why a plain --force-reinstall can silently not fix it.
-    r = subprocess.run([sys.executable, '-m', 'pip', 'install',
-                        '--force-reinstall', '--no-deps', '--no-cache-dir', 'mani-skill'],
-                       capture_output=True, text=True)
+    # timeout=180: avoid hanging forever if PyPI is unreachable from this VM.
+    try:
+        r = subprocess.run([sys.executable, '-m', 'pip', 'install',
+                            '--force-reinstall', '--no-deps', '--no-cache-dir', 'mani-skill'],
+                           capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            'WORKER: pip install timed out after 180s — likely a network issue '
+            'reaching PyPI from this Colab VM. Try a fresh runtime.'
+        )
     if r.returncode != 0:
         print('WORKER: reinstall FAILED:', flush=True)
         print(r.stdout[-3000:], flush=True)
