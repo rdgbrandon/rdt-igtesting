@@ -52,6 +52,11 @@ plot_labels = [
 W = len(plot_labels)
 JOINT_NAMES = ['base rot', 'shoulder', 'upper arm', 'elbow',
                'forearm rot', 'wrist pitch', 'wrist rot', 'gripper']
+# The arm diagram draws base rot at the bottom (mounted on the table) and gripper
+# at the top (free end) — physically accurate. Heatmaps/legends use this same
+# top-to-bottom order (gripper first) so they visually line up with the diagram
+# instead of reading in the opposite direction.
+JOINT_ORDER_DISPLAY = list(range(7, -1, -1))
 _midx = torch.tensor(MANISKILL_INDICES, device=DEVICE)
 _bl   = torch.zeros_like(lang_tokens)
 _dl   = lang_tokens - _bl
@@ -279,18 +284,19 @@ for info in success_frames:
 
     fig_j, (ax_ja, ax_jb) = plt.subplots(2, 1, figsize=(12, 5),
                                            gridspec_kw={'hspace': 0.6})
-    im_ja = ax_ja.imshow(ja_norm.T, cmap='inferno', aspect='auto', vmin=0, vmax=1)
+    im_ja = ax_ja.imshow(ja_norm.T[JOINT_ORDER_DISPLAY], cmap='inferno', aspect='auto', vmin=0, vmax=1)
     ax_ja.set_xticks(range(10))
     ax_ja.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
     ax_ja.set_yticks(range(8))
-    ax_ja.set_yticklabels(JOINT_NAMES, fontsize=9)
-    for ytick, col in zip(ax_ja.get_yticklabels(), plt.cm.tab10(np.arange(8) / 10)):
-        ytick.set_color(col)
-    ax_ja.set_title('Per-joint image attribution  (each joint normalised to its own max)', fontsize=9)
+    ax_ja.set_yticklabels([JOINT_NAMES[j] for j in JOINT_ORDER_DISPLAY], fontsize=9)
+    for ytick, j in zip(ax_ja.get_yticklabels(), JOINT_ORDER_DISPLAY):
+        ytick.set_color(plt.cm.tab10(j / 10))
+    ax_ja.set_title('Per-joint image attribution  (each joint normalised to its own max; '
+                     'rows ordered to match arm diagram: gripper top, base bottom)', fontsize=9)
     fig_j.colorbar(im_ja, ax=ax_ja, fraction=0.03, pad=0.02)
 
     cmap_lines = plt.cm.tab10
-    for j in range(8):
+    for j in JOINT_ORDER_DISPLAY:
         ax_jb.plot(range(10), ja_norm[:, j], 'o-', label=JOINT_NAMES[j],
                    color=cmap_lines(j / 10), linewidth=1.5, markersize=4)
     ax_jb.set_xticks(range(10))
@@ -327,19 +333,20 @@ for info in success_frames:
         (ax3a, _jw_row,  'Row-normalised  — which words each joint cares about'),
         (ax3b, _jw_glob, 'Global-normalised  — cross-joint magnitude comparison'),
     ]:
-        im = ax.imshow(data, cmap='inferno', aspect='auto', vmin=0, vmax=1)
+        data_disp = data[JOINT_ORDER_DISPLAY]   # match arm diagram: gripper top, base bottom
+        im = ax.imshow(data_disp, cmap='inferno', aspect='auto', vmin=0, vmax=1)
         ax.set_xticks(range(W))
         ax.set_xticklabels(plot_labels, rotation=45, ha='right', fontsize=8)
         ax.set_yticks(range(8))
-        ax.set_yticklabels(JOINT_NAMES, fontsize=9)
+        ax.set_yticklabels([JOINT_NAMES[j] for j in JOINT_ORDER_DISPLAY], fontsize=9)
         # Color-match y-tick labels to the arm diagram dots
-        for ytick, col in zip(ax.get_yticklabels(), plt.cm.tab10(np.arange(8) / 10)):
-            ytick.set_color(col)
+        for ytick, j in zip(ax.get_yticklabels(), JOINT_ORDER_DISPLAY):
+            ytick.set_color(plt.cm.tab10(j / 10))
         ax.set_title(title, fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-        for idx in np.argsort(data.ravel())[-5:][::-1]:
+        for idx in np.argsort(data_disp.ravel())[-5:][::-1]:
             r, c = divmod(int(idx), W)
-            ax.text(c, r, f'{data[r, c]:.2f}', ha='center', va='center',
+            ax.text(c, r, f'{data_disp[r, c]:.2f}', ha='center', va='center',
                     fontsize=6, color='white', fontweight='bold')
 
     fig3.suptitle('Word × Joint attribution  |  ' + task +
