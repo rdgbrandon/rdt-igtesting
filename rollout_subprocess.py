@@ -141,7 +141,22 @@ def _encode_6(pil_list):
     return embs.reshape(1, -1, embed_dim)
 
 
-def _render_pil(env):
+def _obs_frame(obs):
+    """Return the first sensor camera image from obs as a PIL Image.
+    Falls back to env.render() caller if sensor_data is absent."""
+    sd = obs.get('sensor_data', obs.get('image', {}))
+    if not sd:
+        return None
+    rgb = sd[list(sd.keys())[0]]['rgb']
+    if hasattr(rgb, 'cpu'): rgb = rgb.cpu().numpy()
+    rgb = np.array(rgb).squeeze().astype(np.uint8)
+    return PILImage.fromarray(rgb)
+
+def _render_pil(env, obs=None):
+    if obs is not None:
+        frame = _obs_frame(obs)
+        if frame is not None:
+            return frame
     r = env.render()
     if hasattr(r, 'cpu'): r = r.cpu().numpy()
     img = PILImage.fromarray(np.array(r).squeeze().astype(np.uint8))
@@ -172,7 +187,7 @@ def _get_joint8(obs):
 def rollout(ep_idx):
     _env = _make_env()
     _obs, _ = _env.reset(seed=ep_idx + args.base_seed)
-    first_frame = _render_pil(_env)
+    first_frame = _render_pil(_env, _obs)
     _hist  = deque([None, first_frame], maxlen=2)
     frames    = [first_frame]            # collect all frames
     qpos_hist = [_get_joint8(_obs)]       # parallel real joint state per frame
@@ -202,11 +217,11 @@ def rollout(ep_idx):
                     _tr = rdt.conditional_sample(
                         _g['lang_cond'], lang_attn_mask, _ic, _sc, _mk.unsqueeze(1), _cf)
             _acts = (_tr[0, :, MANISKILL_INDICES] + 1) / 2 * (ACTION_MAX_t - ACTION_MIN_t) + ACTION_MIN_t
-            chunk = _acts[::4].cpu().float().numpy()
+            chunk = _acts[:16].cpu().float().numpy()
             cp = 0
 
         _obs, _, term, trunc, info = _env.step(chunk[cp].reshape(1, 8))
-        f = _render_pil(_env)
+        f = _render_pil(_env, _obs)
         _hist.append(f)
         frames.append(f)
         qpos_hist.append(_get_joint8(_obs))
