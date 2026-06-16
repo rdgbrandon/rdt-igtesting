@@ -8,13 +8,8 @@
 \usepackage{booktabs}
 \usepackage{enumitem}
 \usepackage{microtype}
-\usepackage{listings}
 \usepackage{caption}
 \usepackage{subcaption}
-\usepackage{algorithm}
-\usepackage{algpseudocode}
-\usepackage{mathtools}
-\usepackage{natbib}
 
 \hypersetup{
     colorlinks=true,
@@ -23,15 +18,8 @@
     urlcolor=blue!70!black,
 }
 
-\lstset{
-  basicstyle=\ttfamily\small,
-  breaklines=true,
-  frame=single,
-  backgroundcolor=\color{gray!8},
-}
-
-\title{\textbf{Interpretability Analysis of RDT-1B Robot Manipulation Policy\\
-via Blur Integrated Gradients in Patch Embedding Space}}
+\title{\textbf{What Does a Robot Policy ``Look At''?}\\
+\large Visualising RDT-1B's Attention with Blur Integrated Gradients}
 \author{Brandon Rodriguez}
 \date{\today}
 
@@ -39,22 +27,18 @@ via Blur Integrated Gradients in Patch Embedding Space}}
 \maketitle
 
 \begin{abstract}
-This report documents an interpretability study of \textbf{RDT-1B}~\citep{Liu2024RDT1B},
-a 1-billion-parameter diffusion-based robot manipulation policy, operating within the
-\textbf{ManiSkill3} simulation environment~\citep{Chen2024ManiSkill3}.
-We apply \textbf{Blur Integrated Gradients (BlurIG)}~\citep{Xu2020BlurIG} in
-SigLIP patch-embedding space to attribute which visual image regions most influence
-the robot's predicted joint trajectories, and separately apply standard
-\textbf{Integrated Gradients (IG)}~\citep{Sundararajan2017IntegratedGradients}
-over the language token embeddings to obtain a joint-resolved word-level attribution
-matrix. The pipeline collects successful rollout episodes across five ManiSkill tasks
-(PickCube, StackCube, PushCube, PegInsertionSide, PlugCharger), runs attribution
-at ten evenly-spaced frames per episode, and produces spatial overlay heatmaps,
-temporal attribution curves, per-joint image-attribution heatmaps, and a
-word $\times$ joint attribution matrix. We additionally document two correctness
-fixes introduced during development: elimination of a random-noise confound
-in the diffusion sampler via seed-fixing, and correction of an attention-mask bug
-that caused pad-token positions to contaminate language attribution scores.
+When a robot arm picks up a cube, which part of the camera image is it actually
+``paying attention to''? This report answers that question for \textbf{RDT-1B},
+a large robot manipulation policy, running inside the \textbf{ManiSkill3} simulation.
+We use two techniques from explainable AI---\textbf{Blur Integrated Gradients (BlurIG)}
+and \textbf{Integrated Gradients (IG)}---to produce coloured heatmaps that highlight
+which image patches and which words in the task instruction drove each robot
+joint's actions at any given moment. We collected real successful rollout episodes
+across five tasks (PickCube, StackCube, PushCube, PegInsertionSide, PlugCharger),
+ran attribution at ten frames per episode, and produced spatial heatmaps, per-joint
+breakdowns, and word-level attribution maps. We also document and fix two bugs
+found along the way: a random noise problem that was corrupting gradient estimates,
+and an attention mask bug that made meaningless ``padding'' tokens appear important.
 \end{abstract}
 
 \tableofcontents
@@ -64,660 +48,586 @@ that caused pad-token positions to contaminate language attribution scores.
 \section{Introduction}
 % ─────────────────────────────────────────────────────────────────────────────
 
-Large visuomotor policies trained by imitation learning or reinforcement learning
-increasingly demonstrate strong performance on complex manipulation tasks, yet their
-internal decision-making remains opaque. Understanding \emph{which visual regions}
-and \emph{which language concepts} drive a policy's joint-level actions is
-essential for debugging failures, building trust, and guiding future model design.
+Modern robot policies are trained end-to-end on large datasets, meaning they
+learn entirely from examples rather than being hand-coded with rules. This makes
+them powerful---but it also makes them hard to understand. If a robot fails to
+insert a peg, we cannot easily tell \emph{why}: was it looking at the wrong part
+of the image? Did it misinterpret the language instruction? Did one joint ignore
+the visual input entirely?
 
-This work applies gradient-based attribution methods to RDT-1B, a recently released
-1B-parameter diffusion transformer policy fine-tuned on the ManiSkill3 benchmark.
-RDT-1B conditions on both a language instruction (encoded by a T5 language model)
-and one or more camera views (encoded by SigLIP), and outputs a 64-step predicted
-action trajectory. The diffusion-based inference makes straightforward attribution
-challenging because the score network must be differentiated \emph{through} multiple
-denoising steps.
+\textbf{Attribution methods} try to answer these questions. Given a neural network
+and an input, an attribution method assigns a score to each input feature (for
+example, each pixel or each word) that reflects how much that feature influenced
+the network's output. High-attribution regions are the things the model ``cared
+about'' when making its decision.
 
-We adopt two complementary attribution strategies:
+This project applies attribution methods to \textbf{RDT-1B}~\cite{Liu2024RDT1B},
+a 1-billion-parameter robot policy trained to follow language instructions while
+looking at camera images. The policy is tested inside \textbf{ManiSkill3}~\cite{Chen2024ManiSkill3},
+a robot simulation environment. We ask two questions:
+
 \begin{enumerate}
-    \item \textbf{Feature-level BlurIG} on SigLIP patch embeddings to identify
-          spatially localised image regions that drive predicted actions.
-    \item \textbf{Word $\times$ Joint IG} on T5 language token embeddings to
-          identify which words in the task instruction most influence each
-          individual robot joint.
+    \item \textbf{Image attribution:} Which parts of the camera image most
+          influenced the robot's joint movements at each moment in time?
+    \item \textbf{Language attribution:} Which words in the task instruction
+          (e.g.\ ``pick up a \emph{red} cube and stack it on top of a
+          \emph{green} cube'') most influenced each individual robot joint?
 \end{enumerate}
 
-Both analyses are run on real successful rollout episodes collected from the
-ManiSkill3 simulation, using the actual robot joint state at each frame so that
-the attribution is conditioned on proprioceptive context that matches the live
-policy execution.
-
 % ─────────────────────────────────────────────────────────────────────────────
-\section{Background and Related Work}
+\section{Background}
 % ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{RDT-1B: A Diffusion Foundation Model for Bimanual Manipulation}
+\subsection{RDT-1B: The Robot Policy}
 
-RDT-1B~\citep{Liu2024RDT1B} is a diffusion-based robot policy with approximately
-one billion parameters. It is built on a transformer backbone that processes three
-types of conditioning tokens: (i) language instructions encoded by a frozen T5
-encoder, (ii) visual observations from up to six camera views encoded by a frozen
-SigLIP vision model, and (iii) proprioceptive state (joint positions and action mask)
-passed through a learned state adaptor. The policy outputs a trajectory of 64 future
-actions in a 128-dimensional unified action space.
+RDT-1B~\cite{Liu2024RDT1B} is a robot manipulation policy with about one billion
+parameters. Think of it as a very large neural network that takes in:
+\begin{itemize}
+    \item A text instruction (e.g.\ ``stack the cubes'')
+    \item Camera images of the scene
+    \item The robot's current joint positions (called \emph{proprioception})
+\end{itemize}
+and outputs a sequence of 64 future joint position targets (a ``plan'' for
+the next few seconds).
 
-The model was pre-trained on diverse robot datasets and subsequently fine-tuned on
-ManiSkill tasks via a DeepSpeed checkpoint
-(\texttt{robotics-diffusion-transformer/maniskill-model} on HuggingFace), which
-provides a version specifically adapted for the five tabletop manipulation tasks
-studied here. During inference, RDT uses a DPM-Solver-based scheduler
-(\texttt{DPMSolverMultistepScheduler}) to denoise an action trajectory from Gaussian
-noise in a small number of steps (five in our experiments).
+RDT is a \emph{diffusion model}~\cite{Ho2020DDPM,Chi2023DiffusionPolicy},
+meaning it generates its action plan the same way an image diffusion model
+generates a picture: it starts from random noise and gradually refines it
+into a coherent trajectory through a denoising process. During inference
+we use just 5 denoising steps for speed.
 
-\paragraph{Unified state vector.}
-RDT represents robot state in a 128-dimensional unified vector, where specific
-indices correspond to each robot's active degrees of freedom. For the ManiSkill
-Franka Panda arm the active dimensions are the seven arm joint positions plus a
-scalar gripper-open value, mapped to fixed positions in the 128-dim vector via
-\texttt{STATE\_VEC\_IDX\_MAPPING}.
+The model was originally pre-trained on large robot datasets and then
+\emph{fine-tuned} specifically on ManiSkill tasks using a checkpoint from
+HuggingFace (\texttt{robotics-diffusion-transformer/maniskill-model}).
 
-\subsection{ManiSkill Simulation Environment}
+\paragraph{How the robot's state is represented.}
+The Franka Panda arm has 7 joints plus a gripper, giving 8 numbers that describe
+where the arm is at any moment. RDT places these 8 numbers into a larger
+128-dimensional vector (most entries are zero for this robot) so that many
+different robot types can share the same model architecture.
 
-ManiSkill3~\citep{Chen2024ManiSkill3} (and its predecessor ManiSkill2~\citep{Gu2023ManiSkill2})
-is a GPU-parallelised robotics simulation and benchmark built on SAPIEN. It provides
-a suite of tabletop manipulation tasks with a Franka Panda robot arm. We study five tasks:
+\subsection{ManiSkill3: The Simulation}
+
+ManiSkill3~\cite{Chen2024ManiSkill3} (and its predecessor ManiSkill2~\cite{Gu2023ManiSkill2})
+is a physics simulation of robot manipulation tasks. We use five tasks:
 
 \begin{table}[h]
 \centering
-\caption{ManiSkill tasks studied in this work.}
+\caption{The five tasks studied in this project.}
 \label{tab:tasks}
 \begin{tabular}{ll}
 \toprule
-\textbf{Task ID} & \textbf{Description} \\
+\textbf{Task} & \textbf{What the robot must do} \\
 \midrule
-PickCube-v1         & Grasp a red cube and move it to a target goal position \\
-StackCube-v1        & Pick up a red cube and stack it on top of a green cube \\
-PushCube-v1         & Push and move a cube to a goal region in front of it \\
-PegInsertionSide-v1 & Pick up an orange-white peg and insert the orange end into a box \\
-PlugCharger-v1      & Insert misplaced shapes into the correct empty slots \\
+PickCube         & Pick up a red cube and move it to a marked goal spot \\
+StackCube        & Pick up the red cube and place it on top of the green cube \\
+PushCube         & Push a cube across the table to a goal region \\
+PegInsertionSide & Pick up a two-coloured peg and insert the orange end into a slot \\
+PlugCharger      & Insert a charger-shaped piece into the correct slot on a board \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The robot is controlled via \texttt{pd\_joint\_pos} mode, which accepts 8-dimensional
-target joint-position commands (7 arm joints in radians + 1 gripper value) at 25\,Hz.
-Each episode runs for at most 400 environment steps.
+The simulation runs at 25 frames per second. The robot is controlled by
+telling it where each joint should be (called \texttt{pd\_joint\_pos} control),
+and it has at most 400 steps to complete a task.
 
-\subsection{Integrated Gradients}
+\subsection{Integrated Gradients (IG): The Core Idea}
 
-Integrated Gradients (IG)~\citep{Sundararajan2017IntegratedGradients} is a
-gradient-based attribution method satisfying two fundamental axioms---\emph{Sensitivity}
-and \emph{Implementation Invariance}---that many simpler gradient methods violate.
+Integrated Gradients~\cite{Sundararajan2017IntegratedGradients} is a technique
+for finding out how much each input feature contributed to a model's output.
+The key insight is to compare the \emph{actual} input against a neutral
+\emph{baseline} (e.g.\ a blank image or a zero vector) and measure how the
+output changes as you gradually ``turn on'' each feature from the baseline
+to the real value.
 
-Given a function $F : \mathbb{R}^n \to \mathbb{R}$, an input $\mathbf{x}$, and a
-baseline $\mathbf{x}'$, the attribution for input dimension $i$ is:
+Concretely: imagine sliding each input feature $x_i$ from baseline $x'_i$ to
+its actual value $x_i$, one tiny step at a time, while watching how the output
+changes. The attribution score for feature $i$ is:
 \begin{equation}
-    \mathrm{IG}_i(\mathbf{x}) =
+    \mathrm{IG}_i(x)
+    \;=\;
     (x_i - x'_i)
     \int_0^1
-    \frac{\partial F\!\left(\mathbf{x}' + \alpha(\mathbf{x} - \mathbf{x}')\right)}
-         {\partial x_i}
-    \,d\alpha.
+    \frac{\partial F\!\bigl(x' + \alpha(x - x')\bigr)}{\partial x_i}
+    \,d\alpha,
     \label{eq:ig}
 \end{equation}
+where $F$ is the model's output score and $\alpha$ is how far along the path
+from baseline to real input we are. In practice this integral is approximated
+by taking $N$ evenly spaced steps.
 
-The integral is approximated by a finite Riemann sum over $N$ steps:
+IG satisfies an important property called \emph{completeness}: the sum of all
+attribution scores always equals $F(\text{real input}) - F(\text{baseline})$.
+This means the attributions fully account for the change in output---nothing is
+left unexplained. This is used as a built-in sanity check.
+
+\subsection{Blur Integrated Gradients (BlurIG): Better Baselines for Images}
+
+Standard IG uses a \emph{black image} (all zeros) as the baseline. For images,
+this is problematic because a completely black image is very unnatural and can
+introduce artifacts in the gradients.
+
+Blur Integrated Gradients~\cite{Xu2020BlurIG} uses a smarter path: instead of
+going from black to the real image, it goes from a \emph{maximally blurred}
+version of the image (all fine details washed out, only rough colour blobs
+remain) to the sharp original. This makes more intuitive sense: the blurred
+image keeps the global colour and layout but removes the specific object details
+we want to attribute.
+
+The ``blurring'' is done by applying a Gaussian blur, which is a standard
+image-smoothing operation controlled by a parameter $\sigma$ (higher $\sigma$
+= more blurring). The attribution path sweeps $\sigma$ from a large value
+(very blurry) down to zero (original sharp image):
+
 \begin{equation}
-    \mathrm{IG}_i(\mathbf{x}) \approx
-    (x_i - x'_i) \cdot
-    \frac{1}{N}
-    \sum_{k=0}^{N-1}
-    \frac{\partial F\!\left(\mathbf{x}' + \tfrac{k+0.5}{N}(\mathbf{x} - \mathbf{x}')\right)}
-         {\partial x_i}.
-\end{equation}
-
-IG satisfies the \emph{Completeness axiom}: the sum of all attributions equals
-$F(\mathbf{x}) - F(\mathbf{x}')$, which provides a built-in sanity check.
-
-In our Word$\times$Joint analysis, we apply IG over the T5 language embedding space.
-The baseline $\mathbf{x}'$ is the all-zero embedding and the target $\mathbf{x}$ is
-the actual language embedding for the task description.
-
-\subsection{Blur Integrated Gradients}
-
-Blur Integrated Gradients (BlurIG)~\citep{Xu2020BlurIG} replaces the linear
-interpolation path of standard IG with a \emph{blur path}: the baseline is a
-maximally blurred version of the input and the path reduces blur sigma from
-$\sigma_{\max}$ to $0$, recovering the original input.
-
-For an image embedding $E$, the blur operator at scale $\sigma$ is:
-\begin{equation}
-    E_\sigma = \mathcal{G}_\sigma(E),
-\end{equation}
-where $\mathcal{G}_\sigma$ applies a Gaussian kernel with standard deviation $\sigma$
-independently at each spatial position. In our implementation, the blur is applied
-in the SigLIP patch-embedding space (treating the $27 \times 27$ patch grid as a
-spatial image with 1152 channels) via \texttt{torchvision.transforms.functional.gaussian\_blur}
-with reflect padding to avoid boundary artifacts.
-
-The BlurIG attribution is:
-\begin{equation}
-    \mathrm{BlurIG}(E) =
-    \int_{\sigma_{\max}}^{0}
-    \frac{\partial F(E_\sigma)}{\partial E_\sigma}
-    \cdot \frac{\partial E_\sigma}{\partial \sigma}
-    \,d\sigma
-    \approx
+    \mathrm{BlurIG}(E)
+    \;\approx\;
     \sum_{k=0}^{K-1}
-    \frac{\partial F(E_{\sigma_k})}{\partial E_{\sigma_k}}
-    \cdot (E_{\sigma_{k+1}} - E_{\sigma_k}).
+    \underbrace{\frac{\partial F(E_{\sigma_k})}{\partial E_{\sigma_k}}}_{\text{gradient at blur step }k}
+    \;\cdot\;
+    \underbrace{(E_{\sigma_{k+1}} - E_{\sigma_k})}_{\text{change in embedding}},
     \label{eq:blurig}
 \end{equation}
+where $E_{\sigma_k}$ is the image embedding blurred at level $\sigma_k$.
 
-BlurIG has the advantage of using a more semantically meaningful baseline than
-a zero or black image: a fully blurred embedding retains global statistics
-(mean colour, brightness) while destroying all high-frequency spatial structure,
-making the path from baseline to target more interpretable.
+\paragraph{Why we work in embedding space, not pixel space.}
+Instead of blurring raw pixels, we blur the output of the \textbf{SigLIP}
+vision encoder~\cite{Zhai2023SigLIP}. SigLIP converts a $384 \times 384$ image
+into a $27 \times 27$ grid of 1152-dimensional vectors (called ``patch
+embeddings''). Each cell in the grid represents a $14 \times 14$ pixel patch.
+We blur in this embedding space because: (1) it is the actual input to RDT,
+so gradients flow cleanly; and (2) 27$\times$27 is much cheaper to compute
+than full-resolution pixel attribution.
 
-\subsection{SigLIP Vision Encoder}
+\subsection{Language Encoding with T5}
 
-SigLIP~\citep{Zhai2023SigLIP} (Sigmoid Loss for Language–Image Pre-Training) is
-a vision-language model that replaces the InfoNCE contrastive loss used in CLIP
-with a simpler sigmoid loss operating on individual image-text pairs rather than
-the full softmax over the batch. We use the \texttt{google/siglip-so400m-patch14-384}
-checkpoint, which encodes $384\times384$ images into a $27\times27=729$ patch grid
-with an embedding dimension of 1152.
+The text instruction (e.g.\ ``pick up a red cube'') is first converted to
+numbers by a \textbf{T5}~\cite{Raffel2020T5} language model. T5 breaks the
+sentence into small pieces called ``tokens'' (roughly one per word), and
+produces a fixed-length sequence of vectors---one per token---that encode
+the meaning of each word in context.
 
-\subsection{T5 Language Encoder}
+The pre-encoded token vectors are downloaded from HuggingFace as \texttt{.pt}
+files, so the full T5 model does not need to run at inference time.
 
-T5~\citep{Raffel2020T5} (Text-to-Text Transfer Transformer) is a transformer
-encoder–decoder pre-trained on a large text corpus with a unified text-to-text
-objective. RDT uses a T5 encoder to produce a fixed-length sequence of language
-token embeddings from the task description. In our pipeline the language embeddings
-are downloaded as pre-encoded \texttt{.pt} files from HuggingFace, avoiding the need
-to load the full T5 model at inference time.
+\subsection{Action Chunking}
 
-\subsection{Diffusion Policies and Action Chunking}
-
-Diffusion Policy~\citep{Chi2023DiffusionPolicy} demonstrated that denoising diffusion
-probabilistic models~\citep{Ho2020DDPM} can represent complex, multi-modal robot
-action distributions and achieve strong manipulation performance. RDT-1B extends
-this idea to a large-scale transformer architecture.
-
-Action chunking~\citep{Zhao2023ACT} refers to executing a finite window of
-$K$ consecutive predicted actions before re-planning with a fresh observation.
-This reduces the compounding of observation and execution errors compared to
-single-step reactive control. In our rollout, RDT predicts 64 future steps and
-we execute the first 16 consecutive steps before issuing a new prediction query.
+Rather than re-planning at every single step, RDT predicts a chunk of 64
+future actions at once and the robot executes the first 16 before requesting
+a new prediction. This is called \emph{action chunking}~\cite{Zhao2023ACT}.
+The advantage is that the robot commits to a locally coherent short-term plan
+instead of being jittery from step-by-step re-planning.
 
 % ─────────────────────────────────────────────────────────────────────────────
-\section{System Architecture}
+\section{System Setup}
 % ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Model Components}
+\subsection{The Robot Arm}
 
-RDT-1B consists of the following frozen or learnable modules used during our
-inference and attribution pipeline:
+We use a Franka Panda, a popular research robot arm with 7 rotational joints
+plus a two-finger gripper. We treat the gripper as a single number (average
+of both finger positions), giving 8 values total. We give these joints
+descriptive names for the visualisations:
 
-\begin{description}[leftmargin=2cm, labelwidth=1.8cm]
-    \item[\texttt{lang\_adaptor}]   Projects T5 token embeddings (dim\,4096) into RDT's
-                                    hidden dimension.
-    \item[\texttt{img\_adaptor}]    Projects SigLIP patch embeddings (dim\,1152) into
-                                    RDT's hidden dimension across all camera slots.
-    \item[\texttt{state\_adaptor}]  Projects the concatenated proprioceptive state
-                                    and action-mask tokens (dim\,$2\times128=256$) into
-                                    RDT's hidden dimension.
-    \item[\texttt{conditional\_sample}]
-                                    Runs the full DPM-Solver denoising loop conditioned
-                                    on all three modalities, returning a
-                                    $(1, 64, 128)$ action trajectory tensor.
-\end{description}
+\begin{center}
+\textbf{base rot} $\to$ \textbf{shoulder} $\to$ \textbf{upper arm} $\to$
+\textbf{elbow} $\to$ \textbf{forearm rot} $\to$ \textbf{wrist pitch} $\to$
+\textbf{wrist rot} $\to$ \textbf{gripper}
+\end{center}
 
-\subsection{Six-View Image Protocol}
+In all heatmaps, joints are displayed with the gripper at the \emph{top}
+and the base at the \emph{bottom}, matching the way the arm looks hanging
+from a table mount.
 
-RDT expects six camera slots:
-$[\mathrm{ext}_{t-1},\, \mathrm{rw}_{t-1},\, \mathrm{lw}_{t-1},\, \mathrm{ext}_{t},\, \mathrm{rw}_{t},\, \mathrm{lw}_{t}]$,
-where ext, rw, lw denote external, right-wrist, and left-wrist views at the
-previous and current timesteps. ManiSkill provides a single external camera;
-missing slots are filled with a neutral background image (SigLIP normalisation
-mean colour). The encoded embeddings are concatenated along the sequence dimension:
-$\mathbf{E}_\mathrm{img} \in \mathbb{R}^{1 \times 4374 \times 1152}$
-($6 \times 729$ patches).
+\subsection{The Six-Camera Slot System}
 
-\subsection{State and Action Representation}
+RDT was designed for robots with multiple cameras (left wrist, right wrist, and
+an external overview camera, each at two consecutive timesteps). ManiSkill
+only provides one external camera. For the missing slots we fill in a neutral
+background image (the SigLIP model's own mean colour), so the model still
+receives a valid-length input. The six slots are:
+\[
+[\underbrace{\mathrm{external}_{t-1}}_{\text{prev.\ frame}},\;
+ \underbrace{\text{blank},\;\text{blank}}_{\text{wrist slots, prev.}},\;
+ \underbrace{\mathrm{external}_{t}}_{\text{current frame}},\;
+ \underbrace{\text{blank},\;\text{blank}}_{\text{wrist slots, curr.}}]
+\]
 
-\paragraph{State normalisation.}
-Raw 9-dimensional Panda qpos (7 arm joints + 2 gripper fingers) is converted to
-an 8-dimensional vector by averaging the two finger positions into a single
-gripper-open scalar. The 8-dim vector is then normalised to $[-1, 1]$ using
-task-specific statistics derived from ManiSkill data:
+\subsection{Normalisation}
+
+All joint angles are rescaled to the range $[-1, 1]$ using statistics
+collected from ManiSkill data:
 \begin{equation}
-    \hat{s}_i = \frac{s_i - s_i^{\min}}{s_i^{\max} - s_i^{\min}} \cdot 2 - 1,
-    \quad i = 1,\ldots,8.
+    \hat{s}_i = \frac{s_i - s_i^{\min}}{s_i^{\max} - s_i^{\min}} \times 2 - 1.
 \end{equation}
-The normalised values are placed into the 128-dim unified state vector at the
-eight ManiSkill-specific indices given by \texttt{STATE\_VEC\_IDX\_MAPPING}.
-
-\paragraph{Action denormalisation.}
-Predicted actions are output in the normalised $[-1,1]$ space and mapped back to
-physical units via the inverse transform using separate ACTION\_MIN and ACTION\_MAX
-statistics (the gripper action range $[-1, 1]$ differs from the state range $[0, 0.04]$):
-\begin{equation}
-    a_i = \frac{\hat{a}_i + 1}{2} \cdot (a_i^{\max} - a_i^{\min}) + a_i^{\min}.
-\end{equation}
+Predicted actions are scaled back to real physical units (radians for joints,
+a $[-1, 1]$ open/close signal for the gripper) before being sent to the
+simulator.
 
 % ─────────────────────────────────────────────────────────────────────────────
-\section{Methodology}
+\section{Methods}
 % ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Rollout Collection}
+\subsection{Collecting Successful Episodes}
 
-Successful episodes are collected by running the fine-tuned RDT-1B policy in closed
-loop within ManiSkill3. For each episode:
-
+Before we can run attribution, we need a real successful episode to analyse.
+The rollout procedure:
 \begin{enumerate}
-    \item The environment is reset with a unique seed derived from a random base seed
-          plus an episode counter, providing reproducible but diverse initial conditions.
-    \item A 2-frame history buffer is maintained. At each step, the current and previous
-          frames are encoded by SigLIP and placed into slots
-          $[\mathrm{ext}_{t-1}, \cdot, \cdot, \mathrm{ext}_{t}, \cdot, \cdot]$.
-    \item RDT predicts a 64-step trajectory. The first 16 consecutive predicted
-          actions are executed in the environment (action chunking with $K=16$)
-          before a new prediction is requested.
-    \item The episode is terminated if ManiSkill signals success
-          (\texttt{info['success']=True}) or after 400 steps.
-    \item On success, 10 evenly-spaced frames (including start and end) together
-          with the corresponding raw joint state (\texttt{qpos8}) at each frame
-          are saved to disk and recorded in a JSON manifest.
+    \item Reset the environment with a random seed.
+    \item At each step, encode the current and previous camera frames with
+          SigLIP and feed them to RDT together with the current joint positions.
+    \item RDT outputs 64 predicted actions. Execute the first 16 in the
+          simulator, then re-plan (action chunking with $K=16$).
+    \item If ManiSkill reports success, save 10 evenly-spaced frames from the
+          episode plus the joint state at each frame.
+    \item Repeat until enough successes are collected.
 \end{enumerate}
 
-\subsection{Feature-Level BlurIG in Patch Embedding Space}
-\label{sec:feature-blurig}
+\subsection{Feature-Level BlurIG: Highlighting Important Image Regions}
 
-Rather than applying BlurIG at the pixel level, we apply it directly in the
-SigLIP patch-embedding space. This has two advantages: (i) SigLIP embeddings are
-the actual inputs to the RDT image adaptor, so gradients flow cleanly without
-passing through the SigLIP encoder, and (ii) the 27$\times$27 spatial grid
-provides a compact attribution map that is less expensive to compute.
+For each saved frame we compute a $27 \times 27$ attribution map showing which
+image patches mattered most. The steps are:
 
-\paragraph{Blur operator.}
-Given a SigLIP embedding tensor $E \in \mathbb{R}^{1 \times 729 \times 1152}$,
-we reshape it to $\mathbb{R}^{1 \times 1152 \times 27 \times 27}$, apply a
-Gaussian kernel with reflect padding, and reshape back. The kernel half-width is
-set to $3\sigma$ rounded to the nearest odd integer:
-\begin{equation}
-    k = 2\lfloor 3\sigma + 0.5 \rfloor + 1.
-\end{equation}
+\begin{enumerate}
+    \item Encode the frame with SigLIP to get patch embeddings $E$.
+    \item Define a score: the magnitude of the robot's predicted
+          \emph{gripper} commands over the next 8 steps---
+          $F(E) = \|\mathbf{a}_{1:8,\,\text{gripper}}\|_2$.
+          A high score means the model is predicting an active gripper movement.
+    \item Run the BlurIG path: blur $E$ at $K$ decreasing sigma values
+          ($\sigma_0 > \sigma_1 > \cdots > \sigma_K = 0$), compute the
+          gradient of $F$ at each blur level, and accumulate the product
+          of gradient and embedding change (Equation~\ref{eq:blurig}).
+    \item Sum the absolute attribution across the 1152 channels at each
+          of the 729 patch positions and normalise to $[0, 1]$.
+    \item Upsample the $27 \times 27$ map to full image resolution and
+          overlay it with a warm colour map (\texttt{inferno}: dark purple =
+          low, bright yellow = high).
+\end{enumerate}
 
-\paragraph{Score function.}
-The scalar score function used for attribution is the $\ell_2$-norm of the
-predicted gripper commands over the first $H=8$ action steps:
-\begin{equation}
-    F(E) = \left\|
-        \mathbf{a}_{1:H,\,\texttt{gripper\_idx}}
-    \right\|_2,
-\end{equation}
-where $\mathbf{a} = \texttt{conditional\_sample}(E)$ is the 64-step action
-trajectory. The gripper index is the 8th ManiSkill dimension within the 128-dim
-action vector.
+\paragraph{Per-joint version.}
+Instead of one score for the gripper, we compute a separate score for
+each of the 8 joints ($s_j = \|\mathbf{a}_{:,j}\|$) and take a separate
+gradient for each joint. This lets us say ``joint $j$ was paying attention
+to patch region $r$'' and produces both per-joint scalar totals and
+a joint-resolved spatial map---all in one pass through the blur schedule
+(rather than running the blur twice, which would give inconsistent results).
 
-\paragraph{Attribution computation.}
-With a blur schedule $\sigma_0 > \sigma_1 > \cdots > \sigma_K = 0$, the BlurIG
-attribution is accumulated as:
-\begin{equation}
-    A = \sum_{k=0}^{K-1}
-    \frac{\partial F(E_{\sigma_k})}{\partial E_{\sigma_k}}
-    \cdot (E_{\sigma_{k+1}} - E_{\sigma_k}).
-\end{equation}
-The final attribution map $\hat{A} \in \mathbb{R}^{27 \times 27}$ is obtained by
-summing the absolute attribution over the channel dimension and normalising to $[0,1]$.
+\subsection{Word $\times$ Joint IG: Which Words Drive Which Joints}
 
-\subsection{Per-Joint Attribution via Unified BlurIG}
-\label{sec:unified-blurig}
+For language attribution we apply standard IG (Equation~\ref{eq:ig}) over
+the T5 token embedding vectors. The baseline is the all-zero vector
+(``empty language'') and the target is the actual task embedding.
 
-Rather than running the blur-path twice (once for the overall spatial map and
-once for per-joint scalars), we compute a single-pass \emph{Unified BlurIG}
-that yields both outputs simultaneously:
+For each of the 15 interpolation steps, we compute a per-joint score
+and take its gradient with respect to the language embedding. The final
+result is an $8 \times W$ matrix where rows are joints and columns
+are word groups, and each cell answers: ``how much did this word
+influence this joint?''
 
-\paragraph{Per-joint score.}
-At each blur step $k$, we define a separate score for each joint $j \in \{0,\ldots,7\}$:
-\begin{equation}
-    s_j(E_{\sigma_k}) =
-    \left\|
-        \mathbf{a}_{:,j,\texttt{MS\_idx}}
-    \right\|
-    \in \mathbb{R},
-\end{equation}
-where \texttt{MS\_idx} are the ManiSkill active indices in the 128-dim vector.
+Two views are shown:
+\begin{itemize}
+    \item \textbf{Row-normalised}: for each joint, which words does it
+          pay the most attention to (relative to its own maximum)?
+    \item \textbf{Global-normalised}: how do attributions compare
+          across all joints and all words simultaneously?
+\end{itemize}
 
-\paragraph{Per-joint spatial attribution.}
-For each joint $j$, a separate gradient is computed:
-\begin{equation}
-    A^{(j)} = \sum_{k=0}^{K-1}
-    \nabla_{E_{\sigma_k}} s_j(E_{\sigma_k})
-    \cdot (E_{\sigma_{k+1}} - E_{\sigma_k}).
-\end{equation}
-The \emph{overall} spatial attribution is the sum across joints:
-$A^{\mathrm{all}} = \sum_j |A^{(j)}|$, and the \emph{per-joint scalar} is
-$c_j = \|A^{(j)}\|_1$. Both are derived from the same gradient computation,
-ensuring consistency between the overall and per-joint views.
-
-\subsection{Word $\times$ Joint Integrated Gradients}
-
-For language attribution we apply standard IG~\eqref{eq:ig} over the T5 embedding
-space with the zero-vector baseline ($\mathbf{x}' = \mathbf{0}$) and the actual
-task language embedding as the target.
-
-\paragraph{Per-joint language score.}
-The score for joint $j$ at interpolation step $\alpha_k = (k+0.5)/N$ is:
-\begin{equation}
-    s_j(\alpha_k) =
-    \left\|
-        \mathbf{a}_{:,j,\texttt{MS\_idx}}
-    \right\|,
-    \quad \mathbf{a} = \texttt{conditional\_sample}(\alpha_k \cdot L),
-\end{equation}
-where $L$ is the full language embedding and the image/state inputs are held fixed
-at the values from the first episode frame.
-
-\paragraph{Attribution matrix.}
-The word$\times$joint attribution matrix $M \in \mathbb{R}^{J \times W}$
-(where $J=8$ joints and $W$ is the number of word groups after tokenisation) is:
-\begin{equation}
-    M_{j,w} = \sum_{i \in \mathcal{G}_w}
-    \sum_{k=0}^{N-1}
-    \left|
-    \frac{\partial s_j}{\partial L_i}\bigg|_{\alpha_k}
-    \cdot L_i
-    \right|,
-\end{equation}
-where $\mathcal{G}_w$ is the set of sub-word token indices belonging to word group $w$.
-
-\subsection{Confound Elimination via Fixed Random Seed}
+\subsection{Fixing the Random Noise Confound}
 \label{sec:seed}
 
-The RDT denoising process starts from a freshly sampled Gaussian noise vector.
-Without intervention, each of the $K$ forward passes in the blur schedule (or the
-$N$ passes in the IG interpolation) would start from a \emph{different} noise
-sample. Score differences between blur steps would then be confounded by noise
-variation rather than solely reflecting the input perturbation being studied.
+RDT's denoising process starts from a random noise sample. If we call
+the denoising function 20 times (once per BlurIG step) with a fresh
+random noise each time, then differences in the score between steps will
+partly reflect the randomness of the noise---not just the blur we changed.
+This would corrupt the attribution.
 
-We fix this by re-seeding both the CPU and GPU random number generators to a
-constant value immediately before each \texttt{conditional\_sample} call:
+\textbf{Fix:} we re-set the random number generator to the same fixed seed
+immediately before every denoising call. This makes all 20 calls start from
+\emph{identical} noise, so the only thing that differs between steps is the
+blur level we are testing. Score differences then purely reflect the effect
+of the blur, giving clean gradients.
+
+\subsection{Fixing the Padding Token Bug}
+\label{sec:pad}
+
+\paragraph{The problem.}
+T5 always outputs a fixed number of tokens (say 64), regardless of how
+long the sentence is. A short instruction like ``stack the cubes'' might
+only use 8 real tokens; the remaining 56 positions are \emph{padding}---
+placeholder slots with no linguistic meaning.
+
+The pre-encoded \texttt{.pt} files downloaded from HuggingFace did not
+include an attention mask (a list of which positions are real vs.\ padding).
+Both scripts defaulted to treating \emph{all} positions as real, so
+RDT attended to the padding positions just like actual words.
+
+Crucially, T5's padding positions are \emph{not} zero-valued in the output---
+the transformer still computes non-trivial numbers there due to how self-attention
+works across the full sequence. RDT picking up on these non-zero padding values
+caused the word$\times$joint heatmap to show bright columns labelled
+\texttt{[pad]}, as if meaningless filler tokens were strongly driving the
+robot's joints.
+
+\paragraph{The fix.}
+We use the T5 tokeniser (a small, fast component) to count how many
+real tokens the task description actually has:
 \begin{equation}
-    \texttt{torch.manual\_seed(IG\_SEED)};
-    \quad \texttt{torch.cuda.manual\_seed\_all(IG\_SEED)}.
+    n_{\mathrm{real}} = |\texttt{tokenise}(\text{task description})|.
 \end{equation}
-This ensures that all denoising trajectories start from the same noise realisation,
-so that score differences are purely a function of the input perturbation.
+We then build an attention mask that is 1 for positions $0 \ldots n_{\mathrm{real}}-1$
+and 0 for everything after. After this fix, padding columns appear uniformly
+dark in all heatmaps.
 
-\subsection{Attention Mask Correction}
-\label{sec:attnmask}
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results: StackCube-v1}
+% ─────────────────────────────────────────────────────────────────────────────
 
-\paragraph{Problem.}
-The T5 encoder produces a fixed-length embedding tensor of size $L_\mathrm{emb}$
-regardless of the sentence length. A task description such as
-\emph{``Pick up a red cube and stack it on top of a green cube''}
-tokenises to approximately 18 real tokens, while $L_\mathrm{emb}$ may be 64 or
-more. The pre-encoded \texttt{.pt} files downloaded from HuggingFace did not
-include a companion attention mask tensor, so both \texttt{rdt\_blurig.py} and
-\texttt{run\_ig.py} fell back to an all-ones mask---causing RDT's cross-attention
-to treat pad embedding positions as if they were real tokens.
+We present results from a successful StackCube-v1 episode (episode 8).
+The task is: pick up the red cube and place it on top of the green cube.
 
-T5 pad positions are not zero-valued in the encoder output: the transformer layers
-compute non-trivial activations even at masked positions. When the downstream RDT
-cross-attention uses an all-ones mask, it attends to these positions, and the IG
-gradient consequently assigns high attribution to what are semantically empty slots.
-This manifested in the word$\times$joint heatmap as bright columns labelled
-\texttt{[pad]}, falsely suggesting that meaningless positions drive the policy.
+\subsection{BlurIG Image Overlays}
 
-\paragraph{Fix.}
-Because the T5 tokeniser vocabulary is shared across all model sizes, we can
-recover the correct real-token count $n_\mathrm{use}$ by tokenising the task
-description with \texttt{t5-small} (lightweight, same vocabulary):
-\begin{equation}
-    n_\mathrm{use} = \min\!\left(|\texttt{tokenize}(\texttt{TASK\_DESCRIPTION})|,\;
-    L_\mathrm{emb}\right).
-\end{equation}
-We then construct the correct attention mask:
-\begin{equation}
-    m_i = \begin{cases} 1 & i < n_\mathrm{use}, \\ 0 & \text{otherwise.} \end{cases}
-\end{equation}
-This mask is applied in all subsequent RDT forward passes, eliminating the pad
-attribution artifact. The pad columns in the heatmap now appear uniformly dark.
+Figure~\ref{fig:blurig_overlay} (top row of images) shows the 10 episode
+frames with BlurIG attribution overlaid. Key observations:
+
+\begin{itemize}
+    \item \textbf{Start frame}: attribution is spread across the scene---the
+          model is scanning the table to locate both cubes and the arm position.
+    \item \textbf{Mid-episode (steps 37--62)}: attribution concentrates
+          strongly on the cubes and the arm/gripper region. This is when the
+          robot is reaching for and grasping the red cube.
+    \item \textbf{Near success (step 99 -- SUCCESS)}: attribution re-concentrates
+          on the gripper and the stacking contact point, as the robot carefully
+          lowers the red cube onto the green one.
+\end{itemize}
+
+\subsection{Mean Attribution Over Time}
+
+The mean BlurIG attribution per frame (Figure~\ref{fig:temporal}) shows a
+clear rise-and-fall pattern:
+\begin{itemize}
+    \item \textbf{Low at start} ($\approx 0.033$): the robot is in its initial
+          position with no urgent action required.
+    \item \textbf{Peak at step 49} ($\approx 0.070$): the robot is actively
+          reaching and grasping, requiring precise visual feedback.
+    \item \textbf{Drop at step 74} ($\approx 0.030$): the robot has already
+          gripped the cube and is executing a pre-planned lift; less real-time
+          visual guidance is needed.
+    \item \textbf{Second peak at SUCCESS} ($\approx 0.067$): the robot is
+          placing the cube, again relying heavily on visual feedback to align
+          the cubes for stacking.
+\end{itemize}
+
+\subsection{Per-Joint Attribution Over Time}
+
+The joint heatmap (Figure~\ref{fig:joints}) reveals which joints relied most
+on visual information at each point:
+
+\begin{itemize}
+    \item \textbf{Gripper} (top row): consistently high throughout. Expected,
+          since the gripper must track the cube to open and close at the right time.
+    \item \textbf{Wrist rot \& wrist pitch}: high early (locating the cube),
+          drops sharply around step 37 as the arm commits to an approach angle,
+          then rises again near the placement.
+    \item \textbf{Elbow \& shoulder}: show a pronounced peak at step 74, when
+          the arm is repositioning for the stacking placement---these large
+          joints need visual confirmation of the destination.
+    \item \textbf{Upper arm} (bottom of the visual rows, shown in green):
+          consistently the \emph{lowest} attribution of all joints throughout
+          the episode. The upper arm does coarse gross positioning that is
+          largely pre-planned and does not need fine visual updates.
+\end{itemize}
+
+\subsection{Word $\times$ Joint Attribution}
+
+The word$\times$joint heatmap (Figure~\ref{fig:wxj}) uses the start frame
+and shows which words in ``Pick up a red cube and stack it on top of a
+green cube'' influenced each joint.
+
+After the padding fix, the pad columns \texttt{[p20]} onward are all dark---
+the fix worked. Key observations from the global-normalised view:
+
+\begin{itemize}
+    \item \textbf{Wrist rot} has the highest overall attribution scores:
+          0.61 on ``pick'', 0.78 on ``up'', 0.92 on ``green''/``cube'',
+          and 0.58 on the final ``cube''. The wrist rotation joint is the most
+          language-sensitive joint---it must orient the gripper in the right
+          direction, so words describing the target object strongly influence it.
+    \item \textbf{``green''} and \textbf{``cube''} (second occurrence) receive
+          the highest attribution across all joints. The second cube mentioned
+          in the sentence is the \emph{destination}---where the robot must
+          place the red cube. The model clearly learned that the second object
+          word specifies the goal, not just the object to pick.
+    \item \textbf{Upper arm, elbow, shoulder}: very low attribution on all words
+          in the global view, confirming that proximal joints are driven more
+          by the spatial/visual plan than by linguistic content.
+\end{itemize}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{Implementation Details}
 % ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Hyperparameters}
+\subsection{Key Settings}
 
 \begin{table}[h]
 \centering
-\caption{Key hyperparameters of the attribution pipeline.}
+\caption{Key settings used in the pipeline.}
 \label{tab:hyperparams}
 \begin{tabular}{lll}
 \toprule
-\textbf{Parameter} & \textbf{Value} & \textbf{Description} \\
+\textbf{Setting} & \textbf{Value} & \textbf{What it controls} \\
 \midrule
-$K$ (BlurIG steps)       & 5 (fast) / 20 (full)    & Blur schedule steps \\
-$N$ (IG steps)           & 15                       & Language IG steps \\
-$\sigma_{\max}$          & 2.0                      & Maximum blur sigma \\
-$H$ (score horizon)      & 8                        & Action steps used in score \\
-\texttt{N\_DDPM\_STEPS}  & 5                        & DPM-Solver inference steps \\
-$K$ (action chunk)       & 16                       & Steps executed before re-plan \\
-Max episode steps        & 400                      & Rollout step cap \\
-Control frequency        & 25\,Hz                   & Passed as \texttt{ctrl\_freqs} \\
-\texttt{IG\_SEED}        & 0                        & Fixed diffusion noise seed \\
+BlurIG steps ($K$)      & 5 (fast) / 20 (full) & How finely the blur path is sampled \\
+IG steps ($N$)           & 15                   & How finely the language path is sampled \\
+Max blur ($\sigma_{\max}$) & 2.0               & How blurry the baseline image is \\
+Score horizon ($H$)      & 8 steps              & How many action steps go into the score \\
+DPM-Solver steps         & 5                    & Denoising steps per RDT call \\
+Action chunk size        & 16                   & Steps executed before re-planning \\
+Max episode length       & 400 steps            & Cutoff if task not completed \\
+IG fixed seed            & 0                    & Noise seed pinned to remove confound \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Joint Ordering Convention}
-
-The eight active Panda joints, in physical order from base to end-effector, are:
-\begin{center}
-\texttt{base rot} $\to$ \texttt{shoulder} $\to$ \texttt{upper arm} $\to$
-\texttt{elbow} $\to$ \texttt{forearm rot} $\to$ \texttt{wrist pitch} $\to$
-\texttt{wrist rot} $\to$ \texttt{gripper}.
-\end{center}
-All heatmaps display joints in \emph{reversed} order (gripper at the top row,
-base rotation at the bottom), matching a physical arm diagram where the free
-end (gripper) is at the top and the fixed base is at the bottom.
-
-\subsection{Wrist Camera Environment}
-
-A custom gymnasium wrapper (\texttt{make\_env\_with\_wrist}) registers a
-subclassed environment variant that mounts an additional wrist camera at the
-\texttt{panda\_hand\_tcp} link using \texttt{CameraConfig} with \texttt{mount=link}.
-This bypasses a bug in ManiSkill's camera code where \texttt{entity\_uid}-based
-mounting fails when \texttt{articulation=None}. The wrist camera provides a
-close-up view of the gripper and object during both rollout and IG analysis
-when available; the system falls back to the base environment camera if
-registration fails.
-
-\subsection{Software Stack}
+\subsection{Software}
 
 \begin{itemize}
-    \item \textbf{Simulation}: ManiSkill3 / SAPIEN; headless rendering via EGL
-          (\texttt{MUJOCO\_GL=egl}).
-    \item \textbf{Models}: RDT-1B and SigLIP loaded from HuggingFace Hub.
-          Training-only dependencies (wandb, deepspeed, flash\_attn) are
-          stubbed out via a dynamic \texttt{ModuleType} stub to avoid import
-          errors in inference-only contexts.
-    \item \textbf{Deep learning}: PyTorch with bfloat16 on CUDA (float32 on CPU).
-    \item \textbf{Visualisation}: Matplotlib with \texttt{inferno} colormap;
-          $\sqrt{\alpha}$ blending for attribution overlays to keep mid-range
-          patches visible while near-zero regions remain transparent.
-    \item \textbf{Environment}: Google Colab A100 GPU; codebase managed in the
-          \texttt{rdgbrandon/rdt-igtesting} GitHub repository.
+    \item \textbf{Simulation}: ManiSkill3 with SAPIEN physics; headless
+          rendering using EGL (no monitor required).
+    \item \textbf{Models}: RDT-1B and SigLIP loaded from HuggingFace.
+    \item \textbf{Deep learning}: PyTorch with bfloat16 precision on GPU.
+    \item \textbf{Plots}: Matplotlib; attribution maps use the
+          \texttt{inferno} colour map with square-root opacity blending
+          (makes mid-level attribution visible without drowning the image).
+    \item \textbf{Environment}: Google Colab A100 GPU. Code at
+          \texttt{rdgbrandon/rdt-igtesting} on GitHub.
 \end{itemize}
 
-% ─────────────────────────────────────────────────────────────────────────────
-\section{Visualisation Pipeline}
-% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Stub Trick for Unused Dependencies}
 
-For each successful episode the pipeline produces five figures:
-
-\paragraph{1. Raw frame strip.}
-Ten evenly-spaced frames from the episode displayed in a $1 \times 10$ grid,
-labelled \emph{start}, \emph{step N}, and \emph{SUCCESS}, giving a visual overview
-of the manipulation trajectory.
-
-\paragraph{2. BlurIG overlay strip.}
-The same ten frames with the spatial attribution heatmap (normalised to $[0,1]$,
-\texttt{inferno} colormap) overlaid with $\sqrt{\alpha} \times 0.85$ transparency.
-A shared colorbar indicates attribution strength. The first frame also reports the
-BlurIG completeness check.
-
-\paragraph{3. Temporal attribution curve.}
-The mean attribution value of the spatial BlurIG map at each of the ten frames,
-plotted as a line graph, showing how the policy's reliance on visual information
-evolves over the episode.
-
-\paragraph{4. Per-joint image attribution heatmap.}
-A $8 \times 10$ matrix (joints $\times$ frames) showing the scalar BlurIG
-attribution for each joint at each frame, normalised per-joint to its own maximum
-so that the temporal pattern for each joint is visible regardless of its absolute
-magnitude. A companion line plot shows the same data as overlapping time series.
-
-\paragraph{5. Word $\times$ Joint attribution heatmap.}
-A $8 \times W$ matrix (joints $\times$ word groups) computed from the first episode
-frame, shown in two normalisation modes: \emph{row-normalised} (which words each
-joint attends to most) and \emph{global-normalised} (cross-joint magnitude comparison).
-Top-5 cells are annotated with their numeric values. A schematic Panda arm diagram
-is shown alongside for joint reference.
+RDT's source code imports \texttt{wandb}, \texttt{deepspeed}, and
+\texttt{flash\_attn} at the top level, but these are only needed for
+\emph{training}, not inference. Rather than installing these large packages,
+we create lightweight ``stub'' objects that pretend to be those modules
+and return harmless placeholder values whenever they are called.
+This lets the model load without those dependencies installed.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{Discussion}
 % ─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Observed Attribution Patterns}
+\subsection{What the Results Tell Us}
 
-The BlurIG overlay consistently highlights the object of interest (cube, peg, or
-charger) and the robot gripper region across all tasks, confirming that the policy
-attends to task-relevant visual information. In earlier frames (before contact),
-attribution concentrates on the target object; in later frames, it shifts toward
-the gripper–object interface as insertion or placement is performed.
+The BlurIG results make intuitive sense: the robot attends most strongly to
+the objects it needs to interact with and to its own gripper, with attention
+peaking at the moments that require the most precise visual feedback (approach,
+grasp, and placement). This is encouraging evidence that RDT-1B has learned
+genuine task-relevant visual attention rather than spurious correlations.
 
-The per-joint temporal heatmap reveals differentiated roles: distal joints
-(wrist pitch, wrist rot, gripper) show high attribution throughout the episode
-and peak near the critical contact moment, while proximal joints (base rot, shoulder)
-show higher relative attribution in early frames during gross arm positioning.
+The word$\times$joint results show that the wrist joints are the most
+language-sensitive, which is physically sensible: the wrist controls the
+orientation of the gripper, and the correct orientation depends on what
+object the robot is supposed to pick up and where it is supposed to place it.
+The clear distinction between ``red cube'' (pick target) and ``green cube''
+(place target) shows the model distinguishes object identity from goal identity
+from language.
 
-\subsection{Pad Token Artifact}
+\subsection{Limitations and What We Fixed}
 
-Before the attention mask correction described in Section~\ref{sec:attnmask},
-the word$\times$joint heatmap showed anomalously high attribution on pad token
-positions (labelled \texttt{[p16]}, \texttt{[p17]}, etc.\ after adding position
-indices). In the global-normalised view, several pad positions scored $0.27$--$0.60$,
-competing with semantically meaningful words like \emph{green} and \emph{cube}.
-After applying the correct attention mask, pad columns are uniformly dark, and
-attribution concentrates on the real task words, producing more interpretable results.
+\paragraph{Precision tasks.}
+PegInsertionSide and PlugCharger tasks had much lower success rates than
+PickCube or StackCube. We identified that one cause was a stride-4
+subsampling of the predicted action trajectory (\texttt{acts[::4]}):
+this skipped three out of every four predicted positions, making the
+robot's movement jerky and imprecise---which is tolerable for picking a
+large cube but causes failure when trying to insert a small peg into a
+precise slot. The fix (use the first 16 \emph{consecutive} predicted
+actions instead) produces smoother motion.
 
-\subsection{Precision Task Challenges}
+\paragraph{Padding token attribution.}
+Before fixing the attention mask, up to 70\% of the word$\times$joint
+heatmap was occupied by padding columns that appeared to have high
+attribution. After the fix, attribution correctly concentrates on the
+actual task words.
 
-PegInsertionSide-v1 and PlugCharger-v1 have substantially lower success rates
-under the policy than PickCube-v1 or PushCube-v1. These tasks require
-sub-millimetre alignment for insertion, which is sensitive to trajectory smoothness.
-During development we identified that naive stride-4 subsampling of the predicted
-trajectory (\texttt{acts[::4]}) produced coarse waypoints spaced 4 timesteps apart
-in the predicted plan but executed 1 timestep apart in the environment, causing
-jerky motion. For precision tasks this was sufficient to cause the approach
-trajectory to miss the insertion target, while the more forgiving cube tasks
-remained largely unaffected. The action-chunking strategy was updated to use
-the first 16 consecutive predicted actions (\texttt{acts[:16]}).
-
-\subsection{Diffusion Inference as a Scoring Function}
-
-Differentiating through a multi-step denoising process is non-trivial: the
-DPM-Solver introduces non-differentiable scheduling steps, and the stochastic
-initial noise would ordinarily confound gradient estimates. Our seed-fixing
-approach (Section~\ref{sec:seed}) addresses the latter. Because we fix the noise
-seed across all blur-schedule steps, the score function is effectively deterministic
-given an embedding input, enabling reliable gradient computation via
-\texttt{torch.autograd.grad} with \texttt{torch.enable\_grad()} wrapping
-the \texttt{conditional\_sample} call.
+\paragraph{Camera view mismatch (discovered).}
+We briefly tried pulling frames from the robot's internal sensor camera
+(\texttt{obs['sensor\_data']}) instead of the external render camera
+(\texttt{env.render()}). This broke \emph{all} tasks including PickCube,
+confirming that the model had been fine-tuned on external render views.
+This change was reverted.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{Conclusion}
 % ─────────────────────────────────────────────────────────────────────────────
 
-We have presented an interpretability pipeline for the RDT-1B robot manipulation
-policy that applies Blur Integrated Gradients in SigLIP patch-embedding space
-and Integrated Gradients over T5 language embeddings to produce spatial and
-semantic attribution maps at the joint level. The pipeline operates on real
-successful rollout episodes collected from ManiSkill3, conditions all attribution
-on the true proprioceptive state at each frame, and provides five complementary
-visualisation outputs per episode. Two correctness issues were identified and
-resolved during development: a random-noise confound in the diffusion sampler
-(fixed by seed-pinning) and an attention-mask bug that allowed pad token positions
-to contaminate language attribution (fixed by inferring the real token count from
-the T5 tokeniser). The resulting analysis reveals clear task-relevant visual
-focus and differentiated joint-level language grounding.
+This project applied Blur Integrated Gradients and Integrated Gradients to
+the RDT-1B robot policy to answer a simple but important question: what is
+the robot ``looking at'' and ``listening to'' when it moves? The results show
+that the policy focuses on task-relevant visual regions (objects and gripper)
+and that different joints are driven by different words in the instruction.
+Along the way, two important bugs were found and fixed---a noise confound in
+the gradient computation and a padding token attribution artifact---improving
+the reliability of the results. The pipeline is fully open-source and
+produces five complementary visualisations per episode that could be used to
+debug and improve robot policies on other tasks.
 
 % ─────────────────────────────────────────────────────────────────────────────
-\bibliographystyle{plainnat}
-\bibliography{references}
-
 \begin{thebibliography}{99}
 
-\bibitem[Liu et al.(2024)]{Liu2024RDT1B}
-Liu, S., Wu, L., Li, B., Tan, H., Chen, H., Wang, Z., Xu, K., Su, H., and Zhu, J.
+\bibitem{Liu2024RDT1B}
+S.\ Liu, L.\ Wu, B.\ Li, H.\ Tan, H.\ Chen, Z.\ Wang, K.\ Xu, H.\ Su, and J.\ Zhu.
 \newblock RDT-1B: A Diffusion Foundation Model for Bimanual Manipulation.
-\newblock \emph{arXiv preprint arXiv:2410.07864}, 2024.
+\newblock \emph{arXiv:2410.07864}, 2024.
 
-\bibitem[Chen et al.(2024)]{Chen2024ManiSkill3}
-Chen, Z.\ et al.
+\bibitem{Chen2024ManiSkill3}
+Z.\ Chen et al.
 \newblock ManiSkill3: GPU Parallelized Robotics Simulation and Rendering for
 Generalizable Embodied AI.
-\newblock \emph{arXiv preprint arXiv:2410.00425}, 2024.
+\newblock \emph{arXiv:2410.00425}, 2024.
 
-\bibitem[Gu et al.(2023)]{Gu2023ManiSkill2}
-Gu, J.\ et al.
+\bibitem{Gu2023ManiSkill2}
+J.\ Gu et al.
 \newblock ManiSkill2: A Unified Benchmark for Generalizable Manipulation Skills.
-\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+\newblock In \emph{ICLR}, 2023.
 
-\bibitem[Sundararajan et al.(2017)]{Sundararajan2017IntegratedGradients}
-Sundararajan, M., Taly, A., and Yan, Q.
+\bibitem{Sundararajan2017IntegratedGradients}
+M.\ Sundararajan, A.\ Taly, and Q.\ Yan.
 \newblock Axiomatic Attribution for Deep Networks.
-\newblock In \emph{Proceedings of the 34th International Conference on Machine
-Learning (ICML)}, pages 3034--3043, 2017.
+\newblock In \emph{ICML}, pages 3034--3043, 2017.
 
-\bibitem[Xu et al.(2020)]{Xu2020BlurIG}
-Xu, S., Venugopalan, S., and Sundararajan, M.
+\bibitem{Xu2020BlurIG}
+S.\ Xu, S.\ Venugopalan, and M.\ Sundararajan.
 \newblock Attribution in Scale and Space.
-\newblock In \emph{IEEE/CVF Conference on Computer Vision and Pattern
-Recognition (CVPR)}, pages 9709--9718, 2020.
+\newblock In \emph{CVPR}, pages 9709--9718, 2020.
 
-\bibitem[Zhai et al.(2023)]{Zhai2023SigLIP}
-Zhai, X., Mustafa, B., Kolesnikov, A., and Beyer, L.
+\bibitem{Zhai2023SigLIP}
+X.\ Zhai, B.\ Mustafa, A.\ Kolesnikov, and L.\ Beyer.
 \newblock Sigmoid Loss for Language Image Pre-Training.
-\newblock In \emph{IEEE/CVF International Conference on Computer Vision
-(ICCV)}, 2023.
+\newblock In \emph{ICCV}, 2023.
 
-\bibitem[Raffel et al.(2020)]{Raffel2020T5}
-Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M.,
-Zhou, Y., Li, W., and Liu, P.~J.
+\bibitem{Raffel2020T5}
+C.\ Raffel et al.
 \newblock Exploring the Limits of Transfer Learning with a Unified
 Text-to-Text Transformer.
-\newblock \emph{Journal of Machine Learning Research}, 21:1--67, 2020.
+\newblock \emph{JMLR}, 21:1--67, 2020.
 
-\bibitem[Chi et al.(2023)]{Chi2023DiffusionPolicy}
-Chi, C., Feng, S., Du, Y., Xu, Z., Cousineau, E., Burchfiel, B., and Song, S.
+\bibitem{Chi2023DiffusionPolicy}
+C.\ Chi, S.\ Feng, Y.\ Du, Z.\ Xu, E.\ Cousineau, B.\ Burchfiel, and S.\ Song.
 \newblock Diffusion Policy: Visuomotor Policy Learning via Action Diffusion.
-\newblock In \emph{Robotics: Science and Systems (RSS)}, 2023.
+\newblock In \emph{RSS}, 2023.
 
-\bibitem[Ho et al.(2020)]{Ho2020DDPM}
-Ho, J., Jain, A., and Abbeel, P.
+\bibitem{Ho2020DDPM}
+J.\ Ho, A.\ Jain, and P.\ Abbeel.
 \newblock Denoising Diffusion Probabilistic Models.
-\newblock In \emph{Advances in Neural Information Processing Systems
-(NeurIPS)}, volume~33, pages 6840--6851, 2020.
+\newblock In \emph{NeurIPS}, volume~33, pages 6840--6851, 2020.
 
-\bibitem[Zhao et al.(2023)]{Zhao2023ACT}
-Zhao, T.~Z., Kumar, V., Levine, S., and Finn, C.
+\bibitem{Zhao2023ACT}
+T.Z.\ Zhao, V.\ Kumar, S.\ Levine, and C.\ Finn.
 \newblock Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware.
-\newblock In \emph{Robotics: Science and Systems (RSS)}, 2023.
+\newblock In \emph{RSS}, 2023.
 
 \end{thebibliography}
 
