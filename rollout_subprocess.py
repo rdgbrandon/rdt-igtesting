@@ -13,8 +13,16 @@ try:
     import mani_skill.utils
 except (ImportError, ModuleNotFoundError):
     print('WORKER: mani_skill.utils missing — force-reinstalling...', flush=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-                    '--force-reinstall', '--no-deps', 'mani-skill'], check=True)
+    # --no-cache-dir: force a fresh download instead of reusing a possibly-corrupted
+    # local pip cache, which is why a plain --force-reinstall can silently not fix it.
+    r = subprocess.run([sys.executable, '-m', 'pip', 'install',
+                        '--force-reinstall', '--no-deps', '--no-cache-dir', 'mani-skill'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print('WORKER: reinstall FAILED:', flush=True)
+        print(r.stdout[-3000:], flush=True)
+        print(r.stderr[-3000:], flush=True)
+        raise RuntimeError('mani-skill reinstall failed — see pip output above')
     print('WORKER: Reinstalled mani-skill — restarting worker...', flush=True)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
