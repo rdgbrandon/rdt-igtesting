@@ -14,7 +14,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     print('WORKER: mani_skill.utils missing — force-reinstalling...', flush=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-                    '--force-reinstall', 'mani-skill'], check=True)
+                    '--force-reinstall', '--no-deps', 'mani-skill'], check=True)
     print('WORKER: Reinstalled mani-skill — restarting worker...', flush=True)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
