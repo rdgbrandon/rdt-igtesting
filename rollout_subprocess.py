@@ -4,7 +4,19 @@ Standalone rollout worker for PickCube-v1.
 Run in a fresh subprocess to avoid Issue #116 state accumulation.
 Usage: python rollout_subprocess.py [--task TASK] [--n N] [--base-seed SEED]
 """
-import os, sys, argparse
+import os, sys, subprocess, argparse
+
+# Self-healing: mani_skill can silently lose its utils subpackage between Colab sessions.
+# Detect it here (fresh subprocess), reinstall, and re-exec so the rest of the script
+# sees a clean installation without requiring any user action.
+try:
+    import mani_skill.utils
+except (ImportError, ModuleNotFoundError):
+    print('WORKER: mani_skill.utils missing — force-reinstalling...', flush=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+                    '--force-reinstall', 'mani-skill'], check=True)
+    print('WORKER: Reinstalled mani-skill — restarting worker...', flush=True)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 os.environ.setdefault('DISPLAY', '')
 os.environ.setdefault('MUJOCO_GL', 'egl')
