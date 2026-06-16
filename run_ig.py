@@ -46,7 +46,7 @@ groups.append(cur)
 for i in range(n_use, L_emb): groups.append([i])
 plot_labels = [
     (_tok.decode([_ids[i].item() for i in g if i < len(_ids)], skip_special_tokens=True).strip()
-     or '[' + str(g[0]) + ']') if g[0] < n_use else '[pad]'
+     or '[' + str(g[0]) + ']') if g[0] < n_use else f'[p{g[0]}]'
     for g in groups
 ]
 W = len(plot_labels)
