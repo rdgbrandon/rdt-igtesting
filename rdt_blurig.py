@@ -328,9 +328,16 @@ else:
 if lang_tokens.dim() == 2:
     lang_tokens = lang_tokens.unsqueeze(0)   # (1, L, 4096)
 lang_tokens    = lang_tokens.to(DEVICE, dtype=DTYPE)
-lang_attn_mask = (lang_attn_mask.bool().to(DEVICE)
-                  if lang_attn_mask is not None
-                  else torch.ones(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE))
+if lang_attn_mask is not None:
+    lang_attn_mask = lang_attn_mask.bool().to(DEVICE)
+else:
+    # .pt file has no mask — infer from tokenizing the task description
+    from transformers import AutoTokenizer as _AutoTok
+    _t5tok = _AutoTok.from_pretrained("t5-small")
+    _n_real = min(len(_t5tok(TASK_DESCRIPTION).input_ids), lang_tokens.shape[1])
+    lang_attn_mask = torch.zeros(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE)
+    lang_attn_mask[0, :_n_real] = True
+    print(f"Language mask inferred: {_n_real} real tokens / {lang_tokens.shape[1]} total")
 print(f"Language embedding: {lang_tokens.shape}")
 
 # ── Vision encoder ────────────────────────────────────────────────────────────

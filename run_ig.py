@@ -37,6 +37,9 @@ L_emb = lang_tokens.shape[1]
 _desc = task2lang.get(task, task)
 _ids  = _tok(_desc, return_tensors='pt').input_ids[0]
 n_use = min(len(_ids), L_emb)
+# Build correct mask: only real token positions are active, pads are excluded
+lang_attn_mask = torch.zeros(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE)
+lang_attn_mask[0, :n_use] = True
 raw_words = _tok.convert_ids_to_tokens(_ids[:n_use])
 groups, cur = [], [0]
 for i in range(1, n_use):
