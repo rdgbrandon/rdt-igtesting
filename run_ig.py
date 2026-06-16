@@ -62,6 +62,19 @@ _bl   = torch.zeros_like(lang_tokens)
 _dl   = lang_tokens - _bl
 N_IG  = 15
 
+_STATE_MIN_DEV = STATE_MIN.to(DEVICE, DTYPE)
+_STATE_MAX_DEV = STATE_MAX.to(DEVICE, DTYPE)
+
+def _seed_step():
+    """Fix the diffusion sampler's initial noise before every rdt.conditional_sample
+    call within an IG/BlurIG path. Without this, each call draws fresh random noise,
+    so differences between steps would be confounded by that randomness rather than
+    purely reflecting the input perturbation (blur level or language interpolation)
+    we're actually trying to attribute. See rdt_blurig.py's rdt_score for the same fix."""
+    torch.manual_seed(IG_SEED)
+    if DEVICE == 'cuda':
+        torch.cuda.manual_seed_all(IG_SEED)
+
 
 def _blur_emb(e, sigma):
     """Gaussian blur in SigLIP patch-embedding space.
@@ -75,47 +88,61 @@ def _blur_emb(e, sigma):
     return img.to(e.dtype).permute(0, 2, 3, 1).reshape(B, T, C)
 
 
-def blurig_image(scene_emb, scene_state, am0):
-    """BlurIG: overall image attribution map (summed over all actions/joints).
-    sigma range matches rdt_blurig.py (2.0 → 0.0) to avoid extreme blurring."""
-    sigmas = [2.0, 1.5, 1.0, 0.5, 0.0]
-    wi_tot = torch.zeros_like(scene_emb)
+def joint_blur_ig(scene_emb, scene_state, am0, sigmas=(2.0, 1.5, 1.0, 0.5, 0.0),
+                   check_completeness=False):
+    """Unified BlurIG: computes per-joint spatial attribution in a single pass
+    through the blur schedule, then derives BOTH the overall (summed) image map
+    and the per-joint scalar totals from it. Replaces the old blurig_image() +
+    per_joint_image_ig() pair, which independently redid nearly the same forward/
+    backward passes at two different (inconsistent) blur resolutions — wasteful
+    and made the "overall" and "per-joint" views not directly comparable.
+
+    check_completeness: if True, also evaluates the score at the unblurred
+    embedding and prints how well sum(IG attributions) matches the actual
+    score change (F(sharp) - F(blurred)) — the IG completeness axiom. A large
+    mismatch would indicate too few blur steps for a reliable approximation.
+    """
+    G = int(scene_emb.shape[1] ** 0.5)
+    joint_attr   = [torch.zeros_like(scene_emb) for _ in range(8)]
+    score_blurred = None
     for k in range(len(sigmas) - 1):
         E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
         E_next = _blur_emb(scene_emb.detach(), sigmas[k + 1])
-        with torch.enable_grad():
-            _ac = rdt.conditional_sample(
-                rdt.lang_adaptor(lang_tokens), lang_attn_mask,
-                rdt.img_adaptor(E_t.repeat(1, 6, 1)),
-                scene_state, am0, ctrl_freqs)
-        score = _ac[:, :8, :][:, :, _midx].norm()
-        g = torch.autograd.grad(score, E_t)[0]
-        wi_tot = wi_tot + g.detach() * (E_next - E_t.detach())
-    G      = int(scene_emb.shape[1] ** 0.5)
-    wi_map = wi_tot.squeeze(0).float().cpu().abs().sum(-1).reshape(G, G).numpy()
-    wi_map = (wi_map - wi_map.min()) / (wi_map.max() - wi_map.min() + 1e-8)
-    return wi_map
-
-
-def per_joint_image_ig(scene_emb, scene_state, am0):
-    """BlurIG per joint: how much each joint's predicted action depends on the image.
-    Uses 2 blur steps (fast) with 8 backward passes per step.
-    Returns shape (8,) — total attribution magnitude per joint."""
-    sigmas = [2.0, 1.0, 0.0]
-    joint_totals = [torch.zeros_like(scene_emb) for _ in range(8)]
-    for k in range(len(sigmas) - 1):
-        E_t    = _blur_emb(scene_emb.detach(), sigmas[k]).requires_grad_(True)
-        E_next = _blur_emb(scene_emb.detach(), sigmas[k + 1])
+        _seed_step()
         with torch.enable_grad():
             _ac = rdt.conditional_sample(
                 rdt.lang_adaptor(lang_tokens), lang_attn_mask,
                 rdt.img_adaptor(E_t.repeat(1, 6, 1)),
                 scene_state, am0, ctrl_freqs)
         js = _ac[:, :8, :][:, :, _midx].norm(dim=(0, 1))   # (8,) per-joint score
+        if k == 0:
+            score_blurred = js.sum().item()
         for j in range(8):
             g = torch.autograd.grad(js[j], E_t, retain_graph=(j < 7))[0]
-            joint_totals[j] = joint_totals[j] + g.detach() * (E_next - E_t.detach())
-    return np.array([joint_totals[j].abs().sum().item() for j in range(8)])
+            joint_attr[j] = joint_attr[j] + g.detach() * (E_next - E_t.detach())
+
+    if check_completeness:
+        _seed_step()
+        with torch.no_grad():
+            _ac_sharp = rdt.conditional_sample(
+                rdt.lang_adaptor(lang_tokens), lang_attn_mask,
+                rdt.img_adaptor(scene_emb.repeat(1, 6, 1)),
+                scene_state, am0, ctrl_freqs)
+        score_sharp = _ac_sharp[:, :8, :][:, :, _midx].norm(dim=(0, 1)).sum().item()
+        signed_sum  = sum(joint_attr[j].sum().item() for j in range(8))
+        print(f'    [completeness check] sum(IG)={signed_sum:.4f}  vs  '
+              f'F(sharp)-F(blurred)={score_sharp - score_blurred:.4f}  '
+              f'({len(sigmas)-1} blur steps)')
+
+    per_joint_raw = np.stack([
+        joint_attr[j].squeeze(0).float().cpu().abs().sum(-1).reshape(G, G).numpy()
+        for j in range(8)
+    ])                                                 # (8, G, G) raw attribution magnitude
+    joint_scalars = per_joint_raw.sum(axis=(1, 2))      # (8,) total per joint
+
+    overall_raw = per_joint_raw.sum(axis=0)             # (G, G) — sum across joints
+    overall_map = (overall_raw - overall_raw.min()) / (overall_raw.max() - overall_raw.min() + 1e-8)
+    return overall_map, joint_scalars, per_joint_raw
 
 
 def word_joint_ig(scene_emb, scene_state, am0):
@@ -124,6 +151,7 @@ def word_joint_ig(scene_emb, scene_state, am0):
     for k in range(N_IG):
         alpha  = (k + 0.5) / N_IG
         interp = (_bl + alpha * _dl).requires_grad_(True)
+        _seed_step()
         with torch.enable_grad():
             _ac = rdt.conditional_sample(
                 rdt.lang_adaptor(interp), lang_attn_mask,
@@ -191,10 +219,19 @@ def _overlay_img(ax, img_np, wi_map):
     rgba[..., 3] = np.sqrt(up) * 0.85
     ax.imshow(rgba)
 
-def _make_state(frame):
+def _make_state(frame, qpos8=None):
+    """qpos8: optional raw (unnormalized) 8-dim joint state [7 arm + gripper] taken
+    from the actual rollout at this frame. Without it, falls back to an all-zero
+    state — which is NOT what the robot's joints actually were at that point, and
+    will bias the attribution since RDT conditions its action on both image and
+    proprioceptive state. Always pass qpos8 when analysing a real rollout frame."""
     with torch.no_grad():
         emb = encode_image(frame)
         _s0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
+        if qpos8 is not None:
+            j8 = torch.tensor(qpos8, dtype=DTYPE, device=DEVICE)
+            jn = (j8 - _STATE_MIN_DEV) / (_STATE_MAX_DEV - _STATE_MIN_DEV).clamp(min=1e-6) * 2 - 1
+            _s0[0, 0, MANISKILL_INDICES] = jn
         _a0 = torch.zeros(1, 1, 128, dtype=DTYPE, device=DEVICE)
         _a0[0, 0, MANISKILL_INDICES] = 1.0
         state = rdt.state_adaptor(torch.cat([_s0, _a0], dim=2))
@@ -226,19 +263,23 @@ for info in success_frames:
     plt.close()
     display(IPyImage(strip_path))
 
-    # ── Row 2: BlurIG overlay per frame ───────────────────────────────────────
-    print('  BlurIG on 10 frames...')
-    wi_means = []
-    _cached_embs, _cached_states, _cached_ams = [], [], []   # reused for per-joint IG
+    # ── Row 2: BlurIG overlay per frame + per-joint breakdown (single pass) ──────
+    # joint_blur_ig() gives both the overall map and per-joint scalars from the
+    # SAME computation, so this one loop replaces what used to be two separate,
+    # inconsistent-resolution passes (blurig_image + per_joint_image_ig).
+    print('  BlurIG on 10 frames (using real per-frame joint state)...')
+    wi_means, joint_attr_rows = [], []
+    _cached_embs, _cached_states, _cached_ams = [], [], []   # kept for word x joint reuse
     fig2, axes2 = plt.subplots(1, 10, figsize=(22, 3))
     fig2.subplots_adjust(right=0.91, wspace=0.04)
-    for k, img_k in enumerate(frames_pil):
-        emb, state, am0 = _make_state(img_k)
+    for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
+        emb, state, am0 = _make_state(img_k, fd.get('qpos8'))
         _cached_embs.append(emb)
         _cached_states.append(state)
         _cached_ams.append(am0)
-        wi_map = blurig_image(emb, state, am0)
+        wi_map, joint_scalars, _ = joint_blur_ig(emb, state, am0, check_completeness=(k == 0))
         wi_means.append(float(wi_map.mean()))
+        joint_attr_rows.append(joint_scalars)
         _overlay_img(axes2[k], np.array(img_k) / 255.0, wi_map)
         axes2[k].set_title(step_labels[k], fontsize=7,
                            fontweight='bold' if k in (0, 9) else 'normal',
@@ -271,14 +312,7 @@ for info in success_frames:
     plt.close()
     display(IPyImage(t_path))
 
-    # ── Per-joint image attribution over time ────────────────────────────────
-    print('  Per-joint image IG across 10 frames...')
-    joint_attr_rows = []
-    for k in range(10):
-        ja = per_joint_image_ig(_cached_embs[k], _cached_states[k], _cached_ams[k])
-        joint_attr_rows.append(ja)
-        print(f'   {k+1}/10', end='\r', flush=True)
-    print()
+    # ── Per-joint image attribution over time (reuses scalars from above) ─────
     ja_mat  = np.array(joint_attr_rows)                                        # (10, 8)
     ja_norm = ja_mat / (ja_mat.max(axis=0, keepdims=True) + 1e-8)             # per-joint norm
 
@@ -314,7 +348,9 @@ for info in success_frames:
 
     # ── Word x Joint (from first frame) ──────────────────────────────────────
     print('  Word x Joint IG...')
-    emb0, state0, am0 = _make_state(frames_pil[0])
+    # Reuse the cached embedding/state from the BlurIG loop above (k=0, real
+    # joint state already applied) instead of recomputing the SigLIP encoding.
+    emb0, state0, am0 = _cached_embs[0], _cached_states[0], _cached_ams[0]
     attr_jw  = word_joint_ig(emb0, state0, am0)
     _jw_row  = attr_jw / (attr_jw.max(axis=1, keepdims=True) + 1e-8)   # per-joint norm
     _jw_glob = attr_jw / (attr_jw.max() + 1e-8)                         # global norm

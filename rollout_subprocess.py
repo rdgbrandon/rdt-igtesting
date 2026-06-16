@@ -161,12 +161,21 @@ def _make_env(max_ep=400):
     return _e
 
 
+def _get_joint8(obs):
+    """Raw (unnormalized) 8-dim joint state [7 arm + gripper] as a plain list,
+    so it can be saved to JSON and later renormalized for IG analysis."""
+    _qp = obs['agent']['qpos']
+    if hasattr(_qp, 'cpu'): _qp = _qp.cpu()
+    return np.array(_qp).flatten()[:8].tolist()
+
+
 def rollout(ep_idx):
     _env = _make_env()
     _obs, _ = _env.reset(seed=ep_idx + args.base_seed)
     first_frame = _render_pil(_env)
     _hist  = deque([None, first_frame], maxlen=2)
-    frames = [first_frame]  # collect all frames
+    frames    = [first_frame]            # collect all frames
+    qpos_hist = [_get_joint8(_obs)]       # parallel real joint state per frame
     chunk, cp, done, step, info = None, 16, False, 0, {}
 
     while not done and step < 400:
@@ -200,6 +209,7 @@ def rollout(ep_idx):
         f = _render_pil(_env)
         _hist.append(f)
         frames.append(f)
+        qpos_hist.append(_get_joint8(_obs))
         done = bool(term) or bool(trunc)
         cp += 1; step += 1
 
@@ -213,7 +223,7 @@ def rollout(ep_idx):
         for k, idx in enumerate(indices):
             path = f'success_ep{ep_idx:02d}_seed{ep_idx+args.base_seed}_f{k:02d}.png'
             frames[idx].save(path)
-            frame_paths.append({'step': idx, 'path': path})
+            frame_paths.append({'step': idx, 'path': path, 'qpos8': qpos_hist[idx]})
         return True, step, frame_paths
     return False, step, []
 

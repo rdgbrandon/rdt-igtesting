@@ -413,12 +413,23 @@ def embed_blur(E, sigma):
              .permute(0, 2, 3, 1).reshape(B, N, D)
 
 
+IG_SEED = 0   # fixed seed for the diffusion sampler's initial noise (see rdt_score)
+
 def rdt_score(E_t):
     """
     Full denoising pass conditioned on blurred image embedding E_t.
     Score = norm of predicted gripper commands over the first SCORE_HORIZON steps.
     Gradient flows: E_t → img_adaptor → img_cond → denoising loop → actions.
+
+    rdt.conditional_sample starts from random Gaussian noise and denoises it —
+    without a fixed seed, every call (one per BlurIG step) draws a *different*
+    noise sample, so score differences between steps would be confounded by
+    random noise, not just the blur change we're trying to measure. Re-seeding
+    right before the call ensures only E_t differs between calls.
     """
+    torch.manual_seed(IG_SEED)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed_all(IG_SEED)
     with torch.enable_grad():
         img_cond = rdt.img_adaptor(E_t.repeat(1, 6, 1))    # (1, 4374, hidden)
         actions  = rdt.conditional_sample(
