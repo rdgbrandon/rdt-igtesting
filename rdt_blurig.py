@@ -7,11 +7,6 @@
 #   SigLIP SO400M (frozen)     →  27x27 patch embeddings
 #   Feature-level BlurIG       →  gradient through img_adaptor + denoising loop
 #   Output                     →  heatmap of which image patches drove gripper action
-#
-# Colab cells are in the repo README. Run order:
-#   Cell 1: install deps
-#   Cell 2: download lang embed from HuggingFace
-#   Cell 3: run this script
 
 import os, sys
 os.environ.setdefault("DISPLAY", "")           # headless rendering for ManiSkill
@@ -75,7 +70,7 @@ if not hasattr(_hfhub, "cached_download"):
 
 # wandb and deepspeed are training-only. Stub them out before RDT imports so
 # their broken protobuf stubs / missing CUDA extensions are never loaded.
-import sys, types, importlib.machinery
+import types, importlib.machinery
 
 def _make_stub(name):
     class _Stub(types.ModuleType):

@@ -74,6 +74,7 @@ parser.add_argument('--task',         default='PickCube-v1')
 parser.add_argument('--n',            type=int, default=1,   help='number of successes to collect')
 parser.add_argument('--max-attempts', type=int, default=500, help='episode cap to avoid infinite loop')
 parser.add_argument('--base-seed',    type=int, default=20241201)
+parser.add_argument('--frames',       type=int, default=30, help='evenly spaced frames to save per success')
 args = parser.parse_args()
 
 os.environ['MANISKILL_TASK'] = args.task
@@ -216,9 +217,9 @@ def rollout(ep_idx):
     _env.close()
     success = bool(info.get('success', False))
     if success:
-        # Sample 10 evenly spaced frames (including first and last)
+        # Sample args.frames evenly spaced frames (including first and last)
         n_total = len(frames)
-        indices = [int(round(i)) for i in np.linspace(0, n_total - 1, 10)]
+        indices = [int(round(i)) for i in np.linspace(0, n_total - 1, args.frames)]
         frame_paths = []
         for k, idx in enumerate(indices):
             path = f'success_ep{ep_idx:02d}_seed{ep_idx+args.base_seed}_f{k:02d}.png'
@@ -247,4 +248,4 @@ n_found = len(success_meta)
 print(f"\nSuccess rate: {n_found}/{ep}  ({100*n_found/max(ep,1):.0f}%)", flush=True)
 with open('success_frames.json', 'w') as f:
     json.dump({'task': args.task, 'base_seed': args.base_seed, 'successes': success_meta}, f)
-print(f"Saved {n_found} success episodes (10 frames each) + success_frames.json", flush=True)
+print(f"Saved {n_found} success episodes ({args.frames} frames each) + success_frames.json", flush=True)

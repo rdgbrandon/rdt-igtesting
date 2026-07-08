@@ -1,4 +1,4 @@
-import json, os
+import json
 import torch, numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as mcm
@@ -30,7 +30,6 @@ _ld = torch.load(_embed_path, map_location='cpu', weights_only=False)
 _lt = _ld if not isinstance(_ld, dict) else _ld['embeddings']
 if _lt.dim() == 2: _lt = _lt.unsqueeze(0)
 lang_tokens    = _lt.to(DEVICE, dtype=DTYPE)
-lang_attn_mask = torch.ones(lang_tokens.shape[:2], dtype=torch.bool, device=DEVICE)
 
 _tok  = AutoTokenizer.from_pretrained('t5-small')
 L_emb = lang_tokens.shape[1]
@@ -95,10 +94,7 @@ def joint_blur_ig(scene_emb, scene_state, am0, sigmas=(2.0, 1.5, 1.0, 0.5, 0.0),
                    check_completeness=False):
     """Unified BlurIG: computes per-joint spatial attribution in a single pass
     through the blur schedule, then derives BOTH the overall (summed) image map
-    and the per-joint scalar totals from it. Replaces the old blurig_image() +
-    per_joint_image_ig() pair, which independently redid nearly the same forward/
-    backward passes at two different (inconsistent) blur resolutions — wasteful
-    and made the "overall" and "per-joint" views not directly comparable.
+    and the per-joint scalar totals from it.
 
     check_completeness: if True, also evaluates the score at the unblurred
     embedding and prints how well sum(IG attributions) matches the actual
@@ -170,6 +166,11 @@ def word_joint_ig(scene_emb, scene_state, am0):
 
 
 _bil = getattr(PILImage, 'Resampling', PILImage).BILINEAR
+try:
+    _inferno = mcm.get_cmap('inferno')          # matplotlib < 3.9
+except AttributeError:
+    import matplotlib
+    _inferno = matplotlib.colormaps['inferno']  # matplotlib >= 3.9
 
 def _draw_arm_on_ax(ax):
     """Draw a simplified Franka Panda arm schematic on ax, matching JOINT_NAMES row order."""
@@ -209,16 +210,13 @@ def _draw_arm_on_ax(ax):
                 fontsize=8, va='center', ha='left',
                 color=colors[i], fontweight='bold')
 
-def _upsample(wi_map):
-    return np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((384, 384), _bil)) / 255.0
-
 def _overlay_img(ax, img_np, wi_map):
     """Overlay heatmap resized to match img_np exactly so pixels align.
     Uses sqrt-alpha so mid-range patches are visible while near-zero stays transparent."""
     h, w = img_np.shape[:2]
     ax.imshow(img_np)
     up = np.array(PILImage.fromarray((wi_map * 255).astype(np.uint8)).resize((w, h), _bil)) / 255.0
-    rgba = mcm.get_cmap('inferno')(up)        # (H, W, 4) RGBA
+    rgba = _inferno(up)                       # (H, W, 4) RGBA
     rgba[..., 3] = np.sqrt(up) * 0.85
     ax.imshow(rgba)
 
@@ -246,17 +244,18 @@ for info in success_frames:
     print('Episode', ep, 'seed=', seed, 'steps=', steps)
 
     frames_pil  = [PILImage.open(fd['path']).convert('RGB') for fd in flist]
+    NF = len(frames_pil)
     step_labels = (['start']
-                   + ['step ' + str(flist[k]['step']) for k in range(1, 9)]
+                   + ['step ' + str(flist[k]['step']) for k in range(1, NF - 1)]
                    + ['SUCCESS'])
 
     # ── Row 1: raw frames ─────────────────────────────────────────────────────
-    fig1, axes1 = plt.subplots(1, 10, figsize=(22, 3))
+    fig1, axes1 = plt.subplots(1, NF, figsize=(2.2 * NF, 3))
     for k, img_k in enumerate(frames_pil):
         axes1[k].imshow(np.array(img_k))
         axes1[k].set_title(step_labels[k], fontsize=7,
-                           fontweight='bold' if k in (0, 9) else 'normal',
-                           color='green' if k == 9 else 'black')
+                           fontweight='bold' if k in (0, NF - 1) else 'normal',
+                           color='green' if k == NF - 1 else 'black')
         axes1[k].axis('off')
     fig1.suptitle(task + '  ep' + str(ep) + '  seed' + str(seed) +
                   '  (' + str(steps) + ' steps)', fontsize=10, y=1.02)
@@ -267,13 +266,10 @@ for info in success_frames:
     display(IPyImage(strip_path))
 
     # ── Row 2: BlurIG overlay per frame + per-joint breakdown (single pass) ──────
-    # joint_blur_ig() gives both the overall map and per-joint scalars from the
-    # SAME computation, so this one loop replaces what used to be two separate,
-    # inconsistent-resolution passes (blurig_image + per_joint_image_ig).
-    print('  BlurIG on 10 frames (using real per-frame joint state)...')
-    wi_means, joint_attr_rows = [], []
+    print(f'  BlurIG on {NF} frames (using real per-frame joint state)...')
+    wi_means, wi_maps, joint_attr_rows = [], [], []
     _cached_embs, _cached_states, _cached_ams = [], [], []   # kept for word x joint reuse
-    fig2, axes2 = plt.subplots(1, 10, figsize=(22, 3))
+    fig2, axes2 = plt.subplots(1, NF, figsize=(2.2 * NF, 3))
     fig2.subplots_adjust(right=0.91, wspace=0.04)
     for k, (fd, img_k) in enumerate(zip(flist, frames_pil)):
         emb, state, am0 = _make_state(img_k, fd.get('qpos8'))
@@ -282,14 +278,18 @@ for info in success_frames:
         _cached_ams.append(am0)
         wi_map, joint_scalars, _ = joint_blur_ig(emb, state, am0, check_completeness=(k == 0))
         wi_means.append(float(wi_map.mean()))
+        wi_maps.append(wi_map)
         joint_attr_rows.append(joint_scalars)
         _overlay_img(axes2[k], np.array(img_k) / 255.0, wi_map)
         axes2[k].set_title(step_labels[k], fontsize=7,
-                           fontweight='bold' if k in (0, 9) else 'normal',
-                           color='green' if k == 9 else 'black')
+                           fontweight='bold' if k in (0, NF - 1) else 'normal',
+                           color='green' if k == NF - 1 else 'black')
         axes2[k].axis('off')
-        print('   ', k + 1, '/ 10', end='\r', flush=True)
+        print('   ', k + 1, '/', NF, end='\r', flush=True)
     print()
+    # Save the per-frame maps so run_video.py can build the IG-overlay video
+    # without redoing the (expensive) BlurIG passes.
+    np.save('ig_maps_ep' + str(ep).zfill(2) + '.npy', np.stack(wi_maps))
     # Colorbar in its own axes — avoid stealing space from frame panels
     cax2 = fig2.add_axes([0.92, 0.12, 0.012, 0.72])
     sm = plt.cm.ScalarMappable(cmap='inferno', norm=plt.Normalize(0, 1))
@@ -302,9 +302,9 @@ for info in success_frames:
     display(IPyImage(ig_strip_path))
 
     # ── Temporal attribution evolution ────────────────────────────────────────
-    fig_t, ax_t = plt.subplots(figsize=(8, 2.5))
-    ax_t.plot(range(10), wi_means, 'o-', color='darkorange', linewidth=2, markersize=6)
-    ax_t.set_xticks(range(10))
+    fig_t, ax_t = plt.subplots(figsize=(max(8, 0.4 * NF), 2.5))
+    ax_t.plot(range(NF), wi_means, 'o-', color='darkorange', linewidth=2, markersize=6)
+    ax_t.set_xticks(range(NF))
     ax_t.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
     ax_t.set_ylabel('Mean attribution', fontsize=9)
     ax_t.set_title('Attribution magnitude over episode  (ep' + str(ep) + ')', fontsize=9)
@@ -316,13 +316,13 @@ for info in success_frames:
     display(IPyImage(t_path))
 
     # ── Per-joint image attribution over time (reuses scalars from above) ─────
-    ja_mat  = np.array(joint_attr_rows)                                        # (10, 8)
+    ja_mat  = np.array(joint_attr_rows)                                        # (NF, 8)
     ja_norm = ja_mat / (ja_mat.max(axis=0, keepdims=True) + 1e-8)             # per-joint norm
 
-    fig_j, (ax_ja, ax_jb) = plt.subplots(2, 1, figsize=(12, 5),
+    fig_j, (ax_ja, ax_jb) = plt.subplots(2, 1, figsize=(max(12, 0.5 * NF), 5),
                                            gridspec_kw={'hspace': 0.6})
     im_ja = ax_ja.imshow(ja_norm.T[JOINT_ORDER_DISPLAY], cmap='inferno', aspect='auto', vmin=0, vmax=1)
-    ax_ja.set_xticks(range(10))
+    ax_ja.set_xticks(range(NF))
     ax_ja.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
     ax_ja.set_yticks(range(8))
     ax_ja.set_yticklabels([JOINT_NAMES[j] for j in JOINT_ORDER_DISPLAY], fontsize=9)
@@ -334,9 +334,9 @@ for info in success_frames:
 
     cmap_lines = plt.cm.tab10
     for j in JOINT_ORDER_DISPLAY:
-        ax_jb.plot(range(10), ja_norm[:, j], 'o-', label=JOINT_NAMES[j],
+        ax_jb.plot(range(NF), ja_norm[:, j], 'o-', label=JOINT_NAMES[j],
                    color=cmap_lines(j / 10), linewidth=1.5, markersize=4)
-    ax_jb.set_xticks(range(10))
+    ax_jb.set_xticks(range(NF))
     ax_jb.set_xticklabels(step_labels, rotation=30, ha='right', fontsize=8)
     ax_jb.set_ylabel('Normalised attribution', fontsize=9)
     ax_jb.set_title('Per-joint image attribution over time', fontsize=9)
