@@ -37,6 +37,17 @@ if RDT_REPO not in sys.path:
 import huggingface_hub as _hfhub  # noqa: E402
 if not hasattr(_hfhub, "cached_download"):
     _hfhub.cached_download = _hfhub.hf_hub_download
+try:                                   # RDT's Hub mixin is only for uploading/downloading checkpoints;
+    import models.hub_mixin  # noqa    # newer huggingface_hub versions break its imports, so fall back
+except Exception:                      # to an inert mixin (we load weights ourselves).
+    import types as _types
+    _hm = _types.ModuleType("models.hub_mixin")
+
+    class CompatiblePyTorchModelHubMixin:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__()
+    _hm.CompatiblePyTorchModelHubMixin = CompatiblePyTorchModelHubMixin
+    sys.modules["models.hub_mixin"] = _hm
 from models.rdt_runner import RDTRunner  # noqa: E402
 from configs.state_vec import STATE_VEC_IDX_MAPPING  # noqa: E402
 from transformers import SiglipImageProcessor, SiglipVisionModel  # noqa: E402
