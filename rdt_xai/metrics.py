@@ -26,10 +26,11 @@ from scipy.stats import spearmanr
 FRACS_FULL = (0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
 FRACS_FAST = (0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
 PATCH = 14
+_trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")       # numpy 2 renamed it
 
 
 def _auc(y, x):
-    return float(np.trapz(y, x) / (x[-1] - x[0]))
+    return float(_trapz(y, x) / (x[-1] - x[0]))
 
 
 class Faithfulness:

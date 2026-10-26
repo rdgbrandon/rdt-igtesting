@@ -94,8 +94,14 @@ class RDTPolicy:
                  num_inference_steps=5, model=None, vision=None, processor=None):
         p = default_paths()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        # bf16 matches the official GPU eval; fp32 is both faster and more exact on CPU.
-        self.dtype = dtype or (torch.bfloat16 if self.device == "cuda" else torch.float32)
+        # The official eval runs bf16; attribution needs cleaner gradients, so
+        # default to fp32 (TF32 tensor cores on Ampere+). RDT_DTYPE=bf16 restores it.
+        if dtype is None:
+            dtype = torch.bfloat16 if os.environ.get("RDT_DTYPE") == "bf16" else torch.float32
+        self.dtype = dtype
+        if self.device == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self.lang_dir = lang_dir or p["lang_dir"]
 
         self.processor = processor or SiglipImageProcessor.from_pretrained(siglip or p["siglip"])
@@ -227,55 +233,77 @@ class RDTPolicy:
         g = torch.Generator(device="cpu").manual_seed(int(seed))
         return torch.randn(batch, self.horizon, self.action_dim, generator=g).to(self.device, self.dtype)
 
-    def sample(self, cond, emb_curr=None, emb_prev=None, noise=None, seed=0, return_attn=False):
-        """Denoise an action chunk. emb_curr/emb_prev override the cached
-        external-camera embeddings (B, 729, 1152) and may require grad.
-        Returns normalized actions (B, 64, 128)."""
-        emb_curr = cond["emb_curr"] if emb_curr is None else emb_curr
-        emb_prev = cond["emb_prev"] if emb_prev is None else emb_prev
-        B = emb_curr.shape[0]
-        if noise is None:
-            noise = self.noise(seed, B)
+    def _bg_ext_kv(self):
+        """K/V of the background embedding placed in the two external slots:
+        used to knock vision out of selected denoising steps."""
+        if getattr(self, "_bg_ext", None) is None:
+            with torch.no_grad():
+                self._bg_ext = (self._ext_kv(self.bg_emb, EXT_PREV), self._ext_kv(self.bg_emb, EXT_CURR))
+        return self._bg_ext
+
+    def _img_kv(self, prev_kv, curr_kv, B):
         bg = self._bg_slot_kv()
-        prev_kv = self._ext_kv(emb_prev, EXT_PREV)
-        curr_kv = self._ext_kv(emb_curr, EXT_CURR)
         img_kv = []
         for bi in range(len(curr_kv)):
             parts = []
             for slot in range(N_SLOTS):
-                if slot == EXT_PREV:
-                    k, v = prev_kv[bi]
-                elif slot == EXT_CURR:
-                    k, v = curr_kv[bi]
-                else:
-                    k, v = bg[slot][bi]
+                k, v = prev_kv[bi] if slot == EXT_PREV else curr_kv[bi] if slot == EXT_CURR else bg[slot][bi]
                 parts.append((k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)))
             img_kv.append((torch.cat([p[0] for p in parts], 2), torch.cat([p[1] for p in parts], 2)))
+        return img_kv
+
+    def sample(self, cond, emb_curr=None, emb_prev=None, noise=None, seed=0, return_attn=False,
+               attn_grad=False, vision_steps=None, step_embs=None):
+        """Denoise an action chunk. Returns normalized actions (B, 64, 128).
+
+        emb_curr/emb_prev: override the external-camera embeddings (B, 729, 1152); may require grad.
+        return_attn:  also return per (step, image block) cross-attention, head-averaged (B, N, L),
+                      or with attn_grad=True the raw (B, H, N, L) weights with retain_grad() set.
+        vision_steps: denoising-step indices that see the real external view; the rest see the
+                      background ("camera missing") embedding. None = all steps.
+        step_embs:    list over steps of (emb_prev_t, emb_curr_t): a separate leaf per step so one
+                      backward pass splits the input gradient by denoising step.
+        """
+        emb_curr = cond["emb_curr"] if emb_curr is None else emb_curr
+        emb_prev = cond["emb_prev"] if emb_prev is None else emb_prev
+        B = step_embs[0][1].shape[0] if step_embs is not None else emb_curr.shape[0]
+        if noise is None:
+            noise = self.noise(seed, B)
+        n_steps = self.rdt.num_inference_timesteps
+        if step_embs is not None:
+            img_kv_steps = [self._img_kv(self._ext_kv(p, EXT_PREV), self._ext_kv(c, EXT_CURR), B) for p, c in step_embs]
+        else:
+            real = self._img_kv(self._ext_kv(emb_prev, EXT_PREV), self._ext_kv(emb_curr, EXT_CURR), B)
+            img_kv_steps = [real] * n_steps
+            if vision_steps is not None:
+                off = self._img_kv(*self._bg_ext_kv(), B)
+                img_kv_steps = [real if s in set(vision_steps) else off for s in range(n_steps)]
         lang_kv = [(k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)) for k, v in cond["lang_kv"]]
         state_traj = cond["state_traj"].expand(B, -1, -1)
 
         rdt, model = self.rdt, self.rdt.model
         sched = rdt.noise_scheduler_sample
-        sched.set_timesteps(rdt.num_inference_timesteps)
+        sched.set_timesteps(n_steps)
         mask = self.elem_mask.expand(B, self.horizon, -1)
         x_act = noise
         freq = model.freq_embedder(self.ctrl_freqs.expand(B)).unsqueeze(1)
         attn_log = [] if return_attn else None
-        for t in sched.timesteps:
+        for si, t in enumerate(sched.timesteps):
+            img_kv = img_kv_steps[si]
             a = rdt.state_adaptor(torch.cat([x_act, mask], dim=2))
             x = torch.cat([state_traj, a], dim=1)
             te = model.t_embedder(t.unsqueeze(-1).to(self.device)).unsqueeze(1).expand(B, -1, -1)
             h = torch.cat([te, freq, x], dim=1) + model.x_pos_embed
             for i, blk in enumerate(model.blocks):
                 k, v = lang_kv[i // 2] if i % 2 == 0 else img_kv[i // 2]
-                h = self._block(blk, h, k, v, attn_log if i % 2 == 1 else None)
+                h = self._block(blk, h, k, v, attn_log if i % 2 == 1 else None, attn_grad)
             out = model.final_layer(h)[:, -self.horizon:]
             x_act = sched.step(out, t, x_act).prev_sample.to(self.dtype)
         x_act = x_act * mask
         return (x_act, attn_log) if return_attn else x_act
 
     @staticmethod
-    def _block(blk, x, k, v, attn_log=None):
+    def _block(blk, x, k, v, attn_log=None, attn_grad=False):
         x = x + blk.attn(blk.norm1(x))
         ca = blk.cross_attn
         y = blk.norm2(x)
@@ -283,7 +311,11 @@ class RDTPolicy:
         q = ca.q_norm(ca.q(y).reshape(B, N, ca.num_heads, ca.head_dim).permute(0, 2, 1, 3))
         if attn_log is not None:
             w = torch.softmax((q * ca.scale) @ k.transpose(-2, -1), dim=-1)
-            attn_log.append(w.mean(1).detach())                                  # (B, N, L)
+            if attn_grad and w.requires_grad:
+                w.retain_grad()
+                attn_log.append(w)                                              # (B, H, N, L)
+            else:
+                attn_log.append(w.mean(1).detach())                             # (B, N, L)
             o = w @ v
         else:
             o = F.scaled_dot_product_attention(q, k, v)

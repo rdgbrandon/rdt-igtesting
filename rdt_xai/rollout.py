@@ -23,7 +23,9 @@ STRIDE = 4                      # official: actions[::4] -> 16 env steps per cal
 def make_env(task, render_backend=None):
     import gymnasium as gym
     import mani_skill.envs  # noqa: F401  (registers envs)
-    kw = dict(obs_mode="rgb", control_mode="pd_joint_pos", render_mode="rgb_array",
+    # The official eval uses obs_mode="rgb" but only consumes env.render() and
+    # qpos; state_dict skips rendering the unused sensor cameras every step.
+    kw = dict(obs_mode="state_dict", control_mode="pd_joint_pos", render_mode="rgb_array",
               reward_mode="dense", sim_backend="cpu")
     if render_backend:
         kw["render_backend"] = render_backend
