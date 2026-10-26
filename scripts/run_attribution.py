@@ -26,11 +26,16 @@ ap.add_argument("--n-seeds", type=int, default=4, help="noise seeds for eig")
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--joints", default="all", help="'all' or comma list of joint ids, e.g. 7 for gripper")
 ap.add_argument("--no-faithfulness", action="store_true")
+ap.add_argument("--fast", action="store_true",
+                help="screening preset: 8 evals, 4x4 occlusion, MoRF+insertion at 5 points, 1 eval seed")
 ap.add_argument("--stability", action="store_true", help="also recompute each map with a second seed")
 ap.add_argument("--only-success", action="store_true")
 ap.add_argument("--threads", type=int, default=0)
 ap.add_argument("--out", default="runs/attr")
 args = ap.parse_args()
+if args.fast:
+    args.n_evals = min(args.n_evals, 8)
+OCC_BLOCK = 4 if args.fast else 3
 if args.threads:
     torch.set_num_threads(args.threads)
 
@@ -42,7 +47,7 @@ from rdt_xai.rollout import load_episode  # noqa: E402
 pol = RDTPolicy()
 joints = None if args.joints == "all" else [int(j) for j in args.joints.split(",")]
 ex = Explainer(pol, joints=joints, batch=args.batch)
-fm = None if args.no_faithfulness else Faithfulness(pol)
+fm = None if args.no_faithfulness else (Faithfulness.fast(pol) if args.fast else Faithfulness(pol))
 methods = args.methods.split(",")
 os.makedirs(args.out, exist_ok=True)
 
@@ -71,11 +76,12 @@ for ep_dir in ep_dirs:
                              joints=args.joints, n_evals=args.n_evals, methods={})
         for m in methods:
             t0 = time.time()
-            r = ex.explain(cond, m, n_evals=args.n_evals, seed=dp["seed"] % 100000, n_seeds=args.n_seeds)
+            r = ex.explain(cond, m, n_evals=args.n_evals, seed=dp["seed"] % 100000, n_seeds=args.n_seeds, occ_block=OCC_BLOCK)
             maps[m] = r["map"]
             rec["methods"][m] = {k: v for k, v in r.items() if k not in ("map", "prev", "curr")}
             if args.stability and m not in ("random",):
-                r2 = ex.explain(cond, m, n_evals=args.n_evals, seed=dp["seed"] % 100000 + 50000, n_seeds=args.n_seeds)
+                r2 = ex.explain(cond, m, n_evals=args.n_evals, seed=dp["seed"] % 100000 + 50000, n_seeds=args.n_seeds,
+                                occ_block=OCC_BLOCK)
                 rec["methods"][m]["seed_spearman"] = rank_agreement(r["map"], r2["map"])
                 rec["methods"][m]["seed_top10_iou"] = topk_iou(r["map"], r2["map"])
                 maps[m + "@seed2"] = r2["map"]
@@ -89,7 +95,8 @@ for ep_dir in ep_dirs:
             for m in methods:
                 rec["methods"][m].update(ff[m])
             print(f"{tag} call {c:3d} faithfulness {time.time()-t0:.1f}s  "
-                  + "  ".join(f"{m}:{ff[m]['deletion_morf']:.2f}/{ff[m]['insertion']:.2f}" for m in methods), flush=True)
+                  + "  ".join(f"{m}:{ff[m]['deletion_morf']:.2f}/{ff[m]['insertion']:.2f}" for m in methods)
+                  + "   (deletion/insertion, higher=better)", flush=True)
         np.savez_compressed(out_json.replace(".json", ".npz"), **maps)
         with open(out_json, "w") as f:
             json.dump(rec, f)

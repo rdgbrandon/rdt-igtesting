@@ -8,32 +8,43 @@ would favour embedding-space baselines). The removal value is RDT's own
 
 Effect size is the L2 deviation of the executed, normalized 8-joint plan from
 the unperturbed plan, averaged over EVALUATION noise seeds that are disjoint
-from the seeds used to compute the explanation.
+from the seeds used to compute the explanation, and normalized by the
+deviation when the whole view is removed, D_full.
 
-  deletion (MoRF)   remove most-relevant patches first; AUC of D(f)/D(1)  higher = better
-  deletion (LeRF)   remove least-relevant first;                          lower  = better
+  deletion (MoRF)   remove most-relevant patches first; AUC of D(f)/D_full      higher = better
+  deletion (LeRF)   remove least-relevant first;                                lower  = better
   insertion         start from all-removed, insert most-relevant first;
-                    AUC of 1 - D(f)/D(0)                                  higher = better
+                    AUC of 1 - D(f)/D_full                                      higher = better
+
+The endpoints (nothing / everything removed) are shared by all methods and
+curves and are computed once.
 """
 import numpy as np
 import torch
 from scipy.stats import spearmanr
 
-FRACS = np.array([0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0])
+FRACS_FULL = (0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
+FRACS_FAST = (0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
 PATCH = 14
 
 
-def _auc(y, x=FRACS):
+def _auc(y, x):
     return float(np.trapz(y, x) / (x[-1] - x[0]))
 
 
 class Faithfulness:
-    def __init__(self, policy, eval_seeds=(101, 202), batch=10):
+    def __init__(self, policy, eval_seeds=(101, 202), fracs=FRACS_FULL, curves=("morf", "lerf", "ins"), batch=10):
         self.p = policy
         self.eval_seeds = list(eval_seeds)
+        self.fracs = np.asarray(fracs, dtype=np.float64)
+        self.curves = tuple(curves)
         self.batch = batch
         with torch.no_grad():
             self.bg_pix = policy.preprocess([policy.bg_image])[0]          # (3, 384, 384)
+
+    @classmethod
+    def fast(cls, policy, batch=10):
+        return cls(policy, eval_seeds=(101,), fracs=FRACS_FAST, curves=("morf", "ins"), batch=batch)
 
     def _patch_mask(self, order, k):
         """Boolean (384,384) pixel mask covering the first k patches in `order`."""
@@ -43,8 +54,6 @@ class Faithfulness:
         m = m.reshape(G, G).repeat_interleave(PATCH, 0).repeat_interleave(PATCH, 1)
         full = torch.zeros(self.bg_pix.shape[-2:], dtype=torch.bool)
         full[:m.shape[0], :m.shape[1]] = m
-        if k == G * G:
-            full[:] = True                                                 # incl. the 6px SigLIP ignores
         return full.to(self.p.device)
 
     @torch.no_grad()
@@ -66,38 +75,48 @@ class Faithfulness:
 
     def evaluate(self, cond, img_prev, img_curr, maps):
         """maps: {method: (27,27) array}. Returns {method: metrics}."""
-        p = self.p
+        p, n = self.p, self.p.n_patch
         x_prev = p.preprocess([img_prev])[0]
         x_curr = p.preprocess([img_curr])[0]
-        n = p.n_patch
-        ks = [int(round(f * n)) for f in FRACS]
-        ref = self._plans(cond, x_prev[None], x_curr[None])[0]                  # (S, 16, 8)
-        dev = lambda P: (P - ref[None]).flatten(2).norm(dim=-1).mean(1).cpu().numpy()   # (N,)
-        res = {}
+        ks = [int(round(f * n)) for f in self.fracs]
+        inner = [k for k in ks if 0 < k < n]
+
+        # shared endpoints: reference plan and fully removed view
+        end = self._plans(cond, torch.stack([x_prev, self.bg_pix]), torch.stack([x_curr, self.bg_pix]))
+        ref = end[0]
+        dev = lambda P: (P - ref[None]).flatten(2).norm(dim=-1).mean(1).cpu().numpy()
+        d_full = max(float(dev(end[1:2])[0]), 1e-8)
+
+        # every (method, curve, interior k) perturbation in one batched pass
+        jobs, pp, pc = [], [], []
         for name, m in maps.items():
             score = torch.as_tensor(np.asarray(m, dtype=np.float32).reshape(-1))
-            more = torch.argsort(score, descending=True)
-            less = torch.argsort(score, descending=False)
-            batches = {}
-            for tag, order, insert in (("morf", more, False), ("lerf", less, False), ("ins", more, True)):
-                pp, pc = [], []
-                for k in ks:
-                    M = self._patch_mask(order, k)
-                    if insert:
+            orders = {"morf": torch.argsort(score, descending=True), "lerf": torch.argsort(score)}
+            orders["ins"] = orders["morf"]
+            for cv in self.curves:
+                for k in inner:
+                    M = self._patch_mask(orders[cv], k)
+                    if cv == "ins":
                         M = ~M
                     pp.append(torch.where(M, self.bg_pix, x_prev))
                     pc.append(torch.where(M, self.bg_pix, x_curr))
-                batches[tag] = (torch.stack(pp), torch.stack(pc))
-            pp = torch.cat([b[0] for b in batches.values()])
-            pc = torch.cat([b[1] for b in batches.values()])
-            d = dev(self._plans(cond, pp, pc)).reshape(3, len(ks))
-            d_full = max(d[0, -1], 1e-8)                                         # everything removed
-            res[name] = dict(
-                deletion_morf=_auc(d[0] / d_full), deletion_lerf=_auc(d[1] / d_full),
-                insertion=_auc(1 - d[2] / max(d[2, 0], 1e-8)),
-                curve_morf=(d[0] / d_full).tolist(), curve_lerf=(d[1] / d_full).tolist(),
-                curve_ins=(1 - d[2] / max(d[2, 0], 1e-8)).tolist(), d_full=float(d_full))
-            res[name]["morf_minus_lerf"] = res[name]["deletion_morf"] - res[name]["deletion_lerf"]
+                    jobs.append((name, cv))
+        d = dev(self._plans(cond, torch.stack(pp), torch.stack(pc))) / d_full if jobs else []
+
+        res = {name: dict(d_full=d_full) for name in maps}
+        it = iter(d)
+        for name in maps:
+            for cv in self.curves:
+                mid = [next(it) for _ in inner]
+                if cv == "ins":
+                    curve = [1.0 - 1.0] + [1.0 - x for x in mid] + [1.0]            # 0 inserted -> all removed
+                    res[name]["insertion"] = _auc(curve, self.fracs)
+                else:
+                    curve = [0.0] + mid + [1.0]
+                    res[name]["deletion_" + cv] = _auc(curve, self.fracs)
+                res[name]["curve_" + cv] = [float(x) for x in curve]
+            if "deletion_lerf" in res[name]:
+                res[name]["morf_minus_lerf"] = res[name]["deletion_morf"] - res[name]["deletion_lerf"]
         return res
 
 

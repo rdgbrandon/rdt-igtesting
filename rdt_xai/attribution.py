@@ -24,7 +24,7 @@ Methods (n_evals = number of gradient evaluations, matched across methods):
   eig         expected IG: background baseline, noise z resampled n_evals
               per evaluation (stratified alphas per seed)  [proposed]
   attn        cross-attention mass on each patch                 0 (1 forward)
-  occlusion   3x3-patch block replacement by background, dF      81 forwards
+  occlusion   kxk-patch block replacement by background, dF     81 (k=3) / 49 (k=4) forwards
   random      iid noise map                                      0
 """
 import math
@@ -118,7 +118,7 @@ class Explainer:
         return ap, ac, target
 
     # ── methods ──────────────────────────────────────────────────────────────
-    def explain(self, cond, method, n_evals=16, seed=0, n_seeds=4, sigma_max=None):
+    def explain(self, cond, method, n_evals=16, seed=0, n_seeds=4, sigma_max=None, occ_block=3):
         """Returns dict(map=(27,27) signed patch attribution summed over both
         slots, prev/curr maps, completeness error, seconds)."""
         t0 = time.time()
@@ -173,7 +173,7 @@ class Explainer:
             m = w[0:n] + w[3 * n:4 * n]                             # prev + curr external slots
             return self._pack(m, None, None, info, t0, unsigned=True)
         elif method == "occlusion":
-            return self._occlusion(cond, seed, t0)
+            return self._occlusion(cond, seed, t0, block=occ_block)
         elif method == "random":
             g = torch.Generator().manual_seed(seed)
             return self._pack(torch.rand(p.n_patch, generator=g), None, None, info, t0, unsigned=True)
