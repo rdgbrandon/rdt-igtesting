@@ -124,6 +124,9 @@ class RDTPolicy:
 
         self.rdt = model if model is not None else self._build_rdt(ckpt or p["ckpt"])
         self.rdt.to(self.device, self.dtype).eval().requires_grad_(False)
+        # RDT's timestep/frequency embedders cast to a dtype fixed at construction
+        for m in (self.rdt.model, self.rdt.model.t_embedder, self.rdt.model.freq_embedder):
+            m.dtype = self.dtype
         self.rdt.num_inference_timesteps = num_inference_steps
         self.horizon = self.rdt.pred_horizon
         self.action_dim = self.rdt.action_dim
