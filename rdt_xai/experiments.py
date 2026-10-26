@@ -9,6 +9,7 @@ that already exist, so an interrupted session resumes where it stopped.
   C  denoise          when during denoising does vision matter: eig split by step + knockout
   D  closed_loop      success rate when top / bottom / random patches are hidden online
   E  sanity           cascading model-parameter randomization (Adebayo et al. 2018)
+  F  language         word x joint attribution (word removal + IG) and vision/language/state Shapley
 """
 import glob
 import json
@@ -20,6 +21,7 @@ import torch
 
 from .attribution import Explainer
 from .closedloop import run_condition
+from .language import LanguageExplainer
 from .metrics import Faithfulness, rank_agreement, topk_iou
 from .rollout import load_episode, make_env, rollout
 
@@ -214,3 +216,35 @@ def sanity(pol, moments, methods, out, n_evals=8, levels=(7, 14, 28), batch=8, v
         for i in range(len(blocks)):
             blocks[i].load_state_dict({kk: vv.to(pol.device) for kk, vv in backup[i].items()})
     _dump(path, rows)
+
+
+# ── F ─────────────────────────────────────────────────────────────────────────
+def language(pol, moments, out, n_evals=16, batch=8, verbose=True):
+    os.makedirs(out, exist_ok=True)
+    lx = LanguageExplainer(pol, batch=batch)
+    cache = {}
+    for d, c in moments:
+        tag = f"{os.path.basename(d)}_call{c:03d}"
+        path = os.path.join(out, tag + ".json")
+        if os.path.exists(path):
+            continue
+        if d not in cache:
+            cache = {d: load_episode(d)}
+        meta = cache[d]
+        dp, cond = _cond(pol, meta, c)
+        seed = dp["seed"] % 100000
+        groups, labels = lx.words(meta["task"])
+        t0 = time.time()
+        drop = lx.word_drop(cond, groups, seeds=(seed, seed + 1))
+        ig, rel = lx.word_ig(cond, groups, n_evals=n_evals, seed=seed)
+        mod = lx.modality(cond, seeds=(seed, seed + 1))
+        agree = [rank_agreement(np.abs(ig[j]), drop[j]) for j in range(8)]
+        _dump(path, dict(moment=tag, task=meta["task"], call=c, step=dp["step"], n_calls=meta["n_calls"],
+                         words=labels, word_drop=drop.tolist(), word_ig=ig.tolist(), ig_completeness_rel_err=rel.tolist(),
+                         ig_drop_spearman=agree, modality=mod, seconds=time.time() - t0))
+        if verbose:
+            tot = sum(abs(v) for v in mod.values()) + 1e-12
+            top = labels[int(np.argmax(drop.sum(0)))]
+            print(f"{tag}  vision/lang/state share {mod['vision']/tot:.2f}/{mod['language']/tot:.2f}/"
+                  f"{mod['state']/tot:.2f}  most important word: '{top}'  IG~drop rho={np.nanmean(agree):.2f}  "
+                  f"{time.time()-t0:.1f}s", flush=True)

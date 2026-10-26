@@ -244,6 +244,50 @@ def sanity_report(out, figdir):
     return t
 
 
+def language_report(out, figdir):
+    from .policy import JOINT_NAMES
+    recs = [json.load(open(f)) for f in glob.glob(os.path.join(out, "F", "*.json"))]
+    if not recs:
+        return None, None
+    tasks = sorted({r["task"] for r in recs})
+    order = list(range(7, -1, -1))                                       # gripper on top, as in the repo's figures
+    fig, axes = plt.subplots(len(tasks), 2, figsize=(14, 3.2 * len(tasks)), squeeze=False)
+    for row, task in zip(axes, tasks):
+        rs = [r for r in recs if r["task"] == task]
+        words = rs[0]["words"]
+        for ax, key, title in ((row[0], "word_drop", "word removal (mask)"), (row[1], "word_ig", "|IG| (zero baseline)")):
+            M = np.mean([np.abs(np.array(r[key])) for r in rs], 0)
+            M = M / (M.max(1, keepdims=True) + 1e-12)
+            ax.imshow(M[order], cmap="inferno", aspect="auto", vmin=0, vmax=1)
+            ax.set_xticks(range(len(words)), words, rotation=60, ha="right", fontsize=7)
+            ax.set_yticks(range(8), [JOINT_NAMES[j] for j in order], fontsize=7)
+            ax.set_title(f"{task}: {title}, row-normalized, n={len(rs)}", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(figdir, "fig_word_joint.png"), dpi=150)
+    plt.close(fig)
+
+    df = pd.DataFrame([dict(task=r["task"], phase=r["call"] / max(1, r["n_calls"] - 1), **r["modality"],
+                            ig_drop_spearman=np.nanmean(r["ig_drop_spearman"]),
+                            ig_completeness=np.mean(r["ig_completeness_rel_err"])) for r in recs])
+    tot = df[["vision", "language", "state"]].abs().sum(1) + 1e-12
+    for k in ("vision", "language", "state"):
+        df[k + "_share"] = df[k].abs() / tot
+    fig, axes = plt.subplots(1, len(tasks), figsize=(4.5 * len(tasks), 3.3), squeeze=False)
+    for ax, task in zip(axes[0], tasks):
+        g = df[df.task == task].sort_values("phase")
+        bins = np.clip((g.phase * 4).astype(int), 0, 3)
+        m = g.groupby(bins)[["vision_share", "language_share", "state_share"]].mean()
+        ax.stackplot(m.index / 4 + 0.125, m.T.values, labels=["vision", "language", "proprioception"], alpha=.85)
+        ax.set_xlim(0, 1), ax.set_ylim(0, 1)
+        ax.set_xlabel("episode progress"), ax.set_title(f"{task}: modality reliance (Shapley share)", fontsize=8)
+    axes[0][0].legend(fontsize=7, loc="lower left")
+    fig.tight_layout()
+    fig.savefig(os.path.join(figdir, "fig_modality.png"), dpi=150)
+    plt.close(fig)
+    summ = df.groupby("task")[["vision_share", "language_share", "state_share", "ig_drop_spearman", "ig_completeness"]].mean()
+    return summ, df
+
+
 def build_report(out, rollout_dir=None):
     rollout_dir = rollout_dir or os.path.join(out, "A")
     figdir = os.path.join(out, "report")
@@ -290,6 +334,13 @@ def build_report(out, rollout_dir=None):
     if sn is not None:
         md += ["## E. Model-randomization sanity check (Spearman to trained-model map)\n",
                sn.rename(index=LABEL).to_markdown(floatfmt=".2f"), "\n"]
+
+    lg, _ = language_report(out, figdir)
+    if lg is not None:
+        lg.to_csv(os.path.join(figdir, "F_language.csv"))
+        md += ["## F. Modality reliance (Shapley share) and word attribution consistency\n",
+               lg.to_markdown(floatfmt=".3f"), "\n",
+               "`ig_drop_spearman`: per-joint rank agreement between |word IG| and word-removal effect.\n"]
 
     text = "\n".join(md)
     with open(os.path.join(figdir, "RESULTS.md"), "w") as f:

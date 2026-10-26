@@ -173,6 +173,19 @@ class RDTPolicy:
             self._lang_cache[task] = e.to(self.device, self.dtype)
         return self._lang_cache[task]
 
+    def empty_lang(self):
+        """RDT's trained "no instruction" input: the T5 encoding of "" (1 token).
+        Training replaces the instruction by it with p=0.1 (train/dataset.py)."""
+        if "__empty__" not in self._lang_cache:
+            e = torch.load(os.path.join(RDT_REPO, "data", "empty_lang_embed.pt"), map_location="cpu", weights_only=False)
+            self._lang_cache["__empty__"] = e.reshape(1, -1, e.shape[-1]).to(self.device, self.dtype)
+        return self._lang_cache["__empty__"]
+
+    def lang_kv(self, lang):
+        """Per-language-block cross-attention K/V for (B, L, 4096) T5 tokens (graph-friendly)."""
+        c = self.rdt.lang_adaptor(lang) + self.rdt.model.lang_cond_pos_embed[:, :lang.shape[1]]
+        return [self._slot_kv(b, c) for i, b in enumerate(self.rdt.model.blocks) if i % 2 == 0]
+
     def preprocess(self, imgs):
         """PIL list -> SigLIP pixel tensor, exactly as maniskill_model.step does."""
         imgs = [_expand2square(self.bg_image if im is None else im.convert("RGB"), self.bg_color) for im in imgs]
@@ -224,16 +237,20 @@ class RDTPolicy:
                 self._bg_kv = kvs
         return self._bg_kv
 
-    def conditions(self, task, emb_prev, emb_curr, qpos8):
+    def conditions(self, task, emb_prev, emb_curr, qpos8, lang=None, null_state=False):
         """Everything except the external-camera embeddings that attribution
-        may perturb: returns a dict reused by `sample`."""
-        lang = self.lang(task)
+        may perturb: returns a dict reused by `sample`.
+        lang: override the instruction tokens (e.g. empty_lang()).
+        null_state: proprioception at the centre of the normalized range (0),
+        approximating training's mean-state dropout."""
+        lang = self.lang(task) if lang is None else lang
         with torch.no_grad():
-            lang_c = self.rdt.lang_adaptor(lang) + self.rdt.model.lang_cond_pos_embed[:, :lang.shape[1]]
-            lang_kv = [self._slot_kv(b, lang_c) for i, b in enumerate(self.rdt.model.blocks) if i % 2 == 0]
+            lang_kv = self.lang_kv(lang)
             st = self.state_token(qpos8)
+            if null_state:
+                st = torch.zeros_like(st)
             state_traj = self.rdt.state_adaptor(torch.cat([st, self.elem_mask], dim=2))
-        return dict(lang_kv=lang_kv, lang_mask=None, state_traj=state_traj, qpos8=np.asarray(qpos8),
+        return dict(lang_kv=lang_kv, lang=lang, state_traj=state_traj, qpos8=np.asarray(qpos8),
                     emb_prev=emb_prev, emb_curr=emb_curr, task=task)
 
     def _ext_kv(self, emb, slot):
@@ -264,7 +281,7 @@ class RDTPolicy:
         return img_kv
 
     def sample(self, cond, emb_curr=None, emb_prev=None, noise=None, seed=0, return_attn=False,
-               attn_grad=False, vision_steps=None, step_embs=None):
+               attn_grad=False, vision_steps=None, step_embs=None, lang_kv=None, lang_mask=None):
         """Denoise an action chunk. Returns normalized actions (B, 64, 128).
 
         emb_curr/emb_prev: override the external-camera embeddings (B, 729, 1152); may require grad.
@@ -274,6 +291,9 @@ class RDTPolicy:
                       background ("camera missing") embedding. None = all steps.
         step_embs:    list over steps of (emb_prev_t, emb_curr_t): a separate leaf per step so one
                       backward pass splits the input gradient by denoising step.
+        lang_kv:      override the language K/V (from lang_kv(), may carry grad; batch 1 or B).
+        lang_mask:    (B, L) bool, False = token removed (RDT is trained with masked, variable-length
+                      instructions, so this is an in-distribution deletion).
         """
         emb_curr = cond["emb_curr"] if emb_curr is None else emb_curr
         emb_prev = cond["emb_prev"] if emb_prev is None else emb_prev
@@ -289,7 +309,8 @@ class RDTPolicy:
             if vision_steps is not None:
                 off = self._img_kv(*self._bg_ext_kv(), B)
                 img_kv_steps = [real if s in set(vision_steps) else off for s in range(n_steps)]
-        lang_kv = [(k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)) for k, v in cond["lang_kv"]]
+        lang_kv = [(k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)) for k, v in (lang_kv or cond["lang_kv"])]
+        lmask = None if lang_mask is None else lang_mask.to(self.device).reshape(B, 1, 1, -1)
         state_traj = cond["state_traj"].expand(B, -1, -1)
 
         rdt, model = self.rdt, self.rdt.model
@@ -307,14 +328,17 @@ class RDTPolicy:
             h = torch.cat([te, freq, x], dim=1) + model.x_pos_embed
             for i, blk in enumerate(model.blocks):
                 k, v = lang_kv[i // 2] if i % 2 == 0 else img_kv[i // 2]
-                h = self._block(blk, h, k, v, attn_log if i % 2 == 1 else None, attn_grad)
+                if i % 2 == 0:
+                    h = self._block(blk, h, k, v, mask=lmask)
+                else:
+                    h = self._block(blk, h, k, v, attn_log, attn_grad)
             out = model.final_layer(h)[:, -self.horizon:]
             x_act = sched.step(out, t, x_act).prev_sample.to(self.dtype)
         x_act = x_act * mask
         return (x_act, attn_log) if return_attn else x_act
 
     @staticmethod
-    def _block(blk, x, k, v, attn_log=None, attn_grad=False):
+    def _block(blk, x, k, v, attn_log=None, attn_grad=False, mask=None):
         x = x + blk.attn(blk.norm1(x))
         ca = blk.cross_attn
         y = blk.norm2(x)
@@ -329,7 +353,7 @@ class RDTPolicy:
                 attn_log.append(w.mean(1).detach())                             # (B, N, L)
             o = w @ v
         else:
-            o = F.scaled_dot_product_attention(q, k, v)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         x = x + ca.proj(o.permute(0, 2, 1, 3).reshape(B, N, C))
         return x + blk.ffn(blk.norm3(x))
 

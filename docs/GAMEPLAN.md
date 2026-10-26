@@ -28,6 +28,9 @@ supplementary Nov 23. Fallbacks if the pilot is weak: ICCV 2027 / CVPR workshops
   (Don't Blind Your VLA '25, Look Before Acting '26, VLA-Trace '26). Closest: *Embodied Interpretability*
   (ICML '26) — gradient-free random masking (ISS) on π0.5, offline only, compared only to attention/token-norm,
   no treatment of sampler noise, no closed-loop masking.
+* **Native baselines:** RDT's training replaces each camera by the SigLIP-mean background image, the
+  instruction by an empty-string embedding and the state by its mean with p=0.1 (`train/dataset.py`), so these are
+  inputs the model was trained to read as "absent" — not ad-hoc black/blur baselines.
 * **Gap we fill:** gradient-based, diffusion-aware attribution for a diffusion VLA (RDT-1B), compared against
   attention (DAAM, GAE) and perturbation (occlusion, ISS) families, validated **in closed loop**, plus an analysis
   of **when during denoising** vision is used.
@@ -41,7 +44,10 @@ supplementary Nov 23. Fallbacks if the pilot is weak: ICCV 2027 / CVPR workshops
    copy of the input; per-step maps sum to the total), plus single-step vision knockout.
 3. **Benchmark:** 11 methods at matched compute on RDT-1B × ManiSkill3, pixel-space faithfulness on held-out
    noise, seed stability, model-randomization sanity checks.
-4. **Closed-loop causal test:** hiding the top-attributed 10% of patches *while the robot acts* vs random /
+4. **Modality reliance and language:** exact Shapley values of vision / language / proprioception, each removed
+   with the "missing" value RDT was *trained* with (it drops each input with p=0.1: background camera image,
+   empty-instruction embedding, mean state), plus word x joint attribution on the correct, unpadded instruction.
+5. **Closed-loop causal test:** hiding the top-attributed 10% of patches *while the robot acts* vs random /
    bottom-10% — task success as the faithfulness metric.
 
 ## 4. Hypotheses the pilot tests
@@ -54,6 +60,7 @@ supplementary Nov 23. Fallbacks if the pilot is weak: ICCV 2027 / CVPR workshops
 | H4 | Hiding Expected-IG top patches hurts success far more than random; bottom patches barely matter | D figure + sign tests |
 | H5 | Vision matters unevenly over denoising steps (concentrated in a few steps) | C figure |
 | H6 | Both history frames carry attribution (single-slot attribution under-counts) | `prev_share` column |
+| H7 | Reliance shifts over an episode (e.g. vision early for localization, proprioception late) — a causal-confusion lens | F modality figure |
 
 Negative outcomes are still publishable as a benchmark (e.g. "occlusion/ISS are most faithful but 5× costlier;
 attention is unreliable for diffusion VLAs"), so the paper does not hinge on our method winning everything.

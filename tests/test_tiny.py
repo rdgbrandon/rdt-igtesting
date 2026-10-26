@@ -107,6 +107,34 @@ check("sum over steps of eig_steps == eig", err < 1e-3, f"rel={err:.1e}  steps s
 ko = ex.knockout(cond, seed=3)
 check("knockout", ko["drop"].shape == (5,) and np.isfinite(ko["drop"]).all(), f"drop={np.round(ko['drop'],2)}")
 
+print("language")
+from rdt_xai.language import LanguageExplainer  # noqa: E402
+lx = LanguageExplainer(pol, batch=8)
+groups, labels = lx.words(task)
+check("words cover all tokens", sum(len(g) for g in groups) == pol.lang(task).shape[1] and labels[-1] == "</s>",
+      " ".join(labels))
+with torch.no_grad():
+    L = pol.lang(task).shape[1]
+    keep = pol.sample(cond, noise=noise, lang_mask=torch.ones(1, L, dtype=torch.bool))
+    m = torch.ones(1, L, dtype=torch.bool); m[0, groups[3]] = False
+    drop1 = pol.sample(cond, noise=noise, lang_mask=m)
+check("lang_mask all-true == default", (keep - ours).abs().max() < 1e-6)
+check("masking a word changes plan", (drop1 - ours).abs().max() > 1e-6)
+wd = lx.word_drop(cond, groups, seeds=(0,))
+check("word_drop", wd.shape == (8, len(groups)) and np.isfinite(wd).all())
+wi, rel = lx.word_ig(cond, groups, n_evals=32, seed=0)
+check("word IG completeness per joint (32 steps)", wi.shape == (8, len(groups)) and rel.max() < 0.05,
+      f"max rel_err={rel.max():.4f}")
+mod = lx.modality(cond, seeds=(0,))
+with torch.no_grad():
+    cns = pol.conditions(task, e[0:1], e[1:2], q, null_state=True)
+    a_all = pol.sample(cond, noise=pol.noise(0))[:, 0:64:4][:, :, pol.idx]
+    a_none = pol.sample(cns, noise=pol.noise(0), emb_prev=pol.bg_emb, emb_curr=pol.bg_emb,
+                        lang_kv=pol.lang_kv(pol.empty_lang()))[:, 0:64:4][:, :, pol.idx]
+eff = float((a_all - a_none).norm())
+check("modality Shapley efficiency", abs(sum(mod.values()) - eff) < 1e-3 * max(1, eff),
+      f"sum={sum(mod.values()):.4f} vs {eff:.4f}  {({k: round(v, 3) for k, v in mod.items()})}")
+
 print("faithfulness")
 for fm, tag in ((Faithfulness.fast(pol), "fast"), (Faithfulness(pol), "full")):
     t1 = time.time()
@@ -146,10 +174,12 @@ for mode in ("top", "bottom", "random"):
     frac = (np.asarray(mc) != np.asarray(img_c)).any(-1).mean()
     check(f"mask hook {mode:6s}", 0.05 < frac < 0.15 and mp is not None, f"masked pixel fraction={frac:.3f}")
 
+X.language(pol, mom[:1], os.path.join(tmp, "F"), n_evals=8, verbose=False)
+check("language stage", len(glob.glob(os.path.join(tmp, "F", "*.json"))) == 1)
 from rdt_xai.report import build_report  # noqa: E402
 txt = build_report(tmp)
 figs = sorted(os.path.basename(f) for f in glob.glob(os.path.join(tmp, "report", "*.png")))
-check("report", "Faithfulness" in txt and len(figs) >= 4, " ".join(figs))
+check("report", "Faithfulness" in txt and "Modality" in txt and "fig_word_joint.png" in figs, " ".join(figs))
 
 if args.rollout:
     print("rollout")
