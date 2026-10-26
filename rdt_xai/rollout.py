@@ -20,12 +20,13 @@ MAX_EPISODE_STEPS = 400
 STRIDE = 4                      # official: actions[::4] -> 16 env steps per call
 
 
-def make_env(task, render_backend=None):
+def make_env(task, render_backend=None, obs_mode=None):
     import gymnasium as gym
     import mani_skill.envs  # noqa: F401  (registers envs)
-    # The official eval uses obs_mode="rgb" but only consumes env.render() and
-    # qpos; state_dict skips rendering the unused sensor cameras every step.
-    kw = dict(obs_mode="state_dict", control_mode="pd_joint_pos", render_mode="rgb_array",
+    # The official eval uses obs_mode="rgb" but only consumes env.render() and qpos;
+    # "state_dict" (RDT_OBS_MODE) skips rendering the unused sensor cameras.
+    obs_mode = obs_mode or os.environ.get("RDT_OBS_MODE", "rgb")
+    kw = dict(obs_mode=obs_mode, control_mode="pd_joint_pos", render_mode="rgb_array",
               reward_mode="dense", sim_backend="cpu")
     if render_backend:
         kw["render_backend"] = render_backend
