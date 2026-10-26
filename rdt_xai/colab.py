@@ -96,3 +96,25 @@ def setup(out_drive):
     os.makedirs(OUT, exist_ok=True)
     print("restored from Drive:", sync(out_drive, OUT), "files")
     return OUT
+
+
+def rdt_era_env(path="/content/py311"):
+    """Python 3.11 venv with the stack RDT was evaluated on (Nov 2024): ManiSkill 3.0.0b15,
+    SAPIEN 3.0.0b1, transformers 4.41, diffusers 0.27.2. Completed installs are marked, so an
+    interrupted build is resumed instead of being mistaken for a finished one."""
+    py, marker = f"{path}/bin/python", f"{path}/.rdt_era_ready"
+    check = (f'{py} -c "import torch, mani_skill, sapien; '
+             f'print(torch.__version__, mani_skill.__version__, sapien.__version__, torch.cuda.is_available())"')
+    if not os.path.exists(marker):
+        sh("pip install -q uv")
+        if not os.path.exists(py):
+            sh(f"uv venv -q --python 3.11 {path}")
+        sh(f'uv pip install -q --python {py} "torch==2.5.1" "torchvision==0.20.1" '
+           "--index-url https://download.pytorch.org/whl/cu121")
+        sh(f'uv pip install -q --python {py} "mani-skill==3.0.0b15" "sapien==3.0.0b1" "transformers==4.41.0" '
+           '"diffusers==0.27.2" "timm==1.0.3" "huggingface_hub==0.23.4" "numpy<2" einops sentencepiece pyyaml '
+           "imageio scipy")
+        sh(check)
+        open(marker, "w").close()
+    print("RDT-era env:", sh(check).strip())
+    return py
