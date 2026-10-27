@@ -134,19 +134,22 @@ def _repro_run(tag, python, task, n, extra):
         return r
     print(f">> {tag}", flush=True)
     env = dict(os.environ, RDT_REPO=RDT_REPO, RDT_DATA=DATA)
+    # one merged stream: reading stderr and stdout one after the other deadlocks once the
+    # child fills the unread pipe (e.g. per-step simulator warnings)
     p = subprocess.Popen([python, "tests/repro.py", "--task", task, "-n", str(n), *extra], cwd=REPO, env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    tail = []
-    for line in p.stderr:
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail, result = [], None
+    for line in p.stdout:
         if line.startswith("  ep"):
             print(line.rstrip(), flush=True)
+        elif line.startswith("RESULT_JSON "):
+            result = line[len("RESULT_JSON "):]
         else:
             tail = (tail + [line])[-25:]
-    out = p.stdout.read().strip().splitlines()
-    if p.wait() != 0 or not out:
+    if p.wait() != 0 or result is None:
         print(f"{tag} FAILED (exit {p.returncode}):\n" + "".join(tail))
         return None
-    r = json.loads(out[-1])
+    r = json.loads(result)
     json.dump(r, open(path, "w"))
     print(f"{tag}: {r['success_rate']:.0%}  ({r['minutes']:.1f} min)\n", flush=True)
     return r
@@ -195,7 +198,7 @@ def rdt_era_env(path="/content/py311"):
            "--index-url https://download.pytorch.org/whl/cu121")
         sh(f'uv pip install -q --python {py} "mani-skill==3.0.0b15" "sapien==3.0.0b1" "transformers==4.41.0" '
            '"diffusers==0.27.2" "timm==1.0.3" "huggingface_hub==0.23.4" "numpy<2" einops sentencepiece pyyaml '
-           "imageio imageio-ffmpeg scipy")
+           "imageio imageio-ffmpeg scipy nvidia-ml-py \"setuptools<70\"")   # sapien 3.0.0b1 imports pkg_resources
         sh(check)
         open(marker, "w").close()
     print("RDT-era env:", sh(check).strip())

@@ -124,6 +124,6 @@ else:
         steps.append(r["steps"])
         print(f"  ep {ep:3d} success={succ[-1]} steps={r['steps']}", file=sys.stderr, flush=True)
 
-print(json.dumps(dict(impl=args.impl, task=args.task, dtype=args.dtype, obs=args.obs if args.impl == "ours" else "rgb",
+print("RESULT_JSON " + json.dumps(dict(impl=args.impl, task=args.task, dtype=args.dtype, obs=args.obs if args.impl == "ours" else "rgb",
                       n=len(succ), success_rate=float(np.mean(succ)), mean_steps=float(np.mean(steps)),
                       minutes=(time.time() - t0) / 60, versions=versions())))
