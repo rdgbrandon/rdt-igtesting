@@ -155,31 +155,59 @@ def _repro_run(tag, python, task, n, extra):
     return r
 
 
-def repro_check(task="PickCube-v1", n=10):
-    """Does RDT reproduce its paper success rate, and with which simulator? Three runs:
-    official code on the current stack, official code on the Nov-2024 stack, this repo on the Nov-2024 stack."""
+def _wilson(k, n, z=1.96):
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5 / d
+    return c - h, c + h
+
+
+def repro_check(task="PickCube-v1", n=50):
+    """Does RDT reproduce its paper success rate, and with which simulator? 2 x 2 design:
+    {official eval code, this repo} x {current ManiSkill 3.0.1, Nov-2024 ManiSkill 3.0.0b15}, same seeds.
+    Prints per-run success with 95% Wilson CIs and pooled exact tests for the simulator and code effects."""
     from scipy.stats import fisher_exact
     prepare()
     download_models()
-    res = {"official / current sim (ManiSkill 3.0.1)": _repro_run("official_current", sys.executable, task, n,
-                                                                   ["--impl", "official", "--dtype", "bf16"])}
-    py = rdt_era_env()
-    res["official / 2024 sim (ManiSkill 3.0.0b15)"] = _repro_run("official_rdt_era", py, task, n,
-                                                                 ["--impl", "official", "--dtype", "bf16"])
-    res["this repo / 2024 sim (ManiSkill 3.0.0b15)"] = _repro_run("ours_rdt_era", py, task, n,
-                                                                  ["--impl", "ours", "--dtype", "fp32", "--obs", "rgb"])
+    runs = [("official", "current", "official_current", ["--impl", "official", "--dtype", "bf16"]),
+            ("this repo", "current", "ours_current", ["--impl", "ours", "--dtype", "fp32", "--obs", "rgb"]),
+            ("official", "2024", "official_rdt_era", ["--impl", "official", "--dtype", "bf16"]),
+            ("this repo", "2024", "ours_rdt_era", ["--impl", "ours", "--dtype", "fp32", "--obs", "rgb"])]
+    py = {"current": sys.executable}
+    res = {}
+    for impl, sim, tag, extra in runs:
+        if sim not in py:
+            py[sim] = rdt_era_env()
+        res[(impl, sim)] = _repro_run(tag, py[sim], task, n, extra)
     paper = PAPER.get(task)
-    print(f"\n===== {task}: RDT paper {paper:.1%} =====")
-    for k, r in res.items():
+    label = {"current": "current sim (ManiSkill 3.0.1)", "2024": "2024 sim (ManiSkill 3.0.0b15)"}
+    print(f"\n===== {task}: RDT paper {paper:.1%} (250 trials) =====")
+    counts = {}
+    for (impl, sim), r in res.items():
         if r is None:
-            print(f"{k:45s} FAILED")
+            print(f"{impl + ' / ' + label[sim]:42s} FAILED")
             continue
-        k_succ = round(r["success_rate"] * r["n"])
-        # one-sided exact test against the paper rate as if it came from 250 trials
-        _, pv = fisher_exact([[k_succ, r["n"] - k_succ], [round(paper * 250), 250 - round(paper * 250)]],
-                             alternative="less")
-        print(f"{k:45s} {k_succ:2d}/{r['n']} = {r['success_rate']:4.0%}   "
-              f"p(below paper) = {pv:.3f}   sapien {r['versions']['sapien']}")
+        k = round(r["success_rate"] * r["n"])
+        counts[(impl, sim)] = (k, r["n"])
+        lo, hi = _wilson(k, r["n"])
+        _, pv = fisher_exact([[k, r["n"] - k], [round(paper * 250), 250 - round(paper * 250)]], alternative="less")
+        print(f"{impl + ' / ' + label[sim]:42s} {k:3d}/{r['n']:<3d} = {k / r['n']:4.0%}  95% CI [{lo:4.0%}, {hi:4.0%}]  "
+              f"p(below paper) = {pv:.3f}")
+
+    def pooled(keys):
+        ks = [counts[x] for x in keys if x in counts]
+        return sum(k for k, _ in ks), sum(m for _, m in ks)
+
+    for name, a_keys, b_keys in (
+            ("simulator: 2024 vs current", [("official", "2024"), ("this repo", "2024")],
+             [("official", "current"), ("this repo", "current")]),
+            ("code: this repo vs official", [("this repo", "current"), ("this repo", "2024")],
+             [("official", "current"), ("official", "2024")])):
+        (ka, na), (kb, nb) = pooled(a_keys), pooled(b_keys)
+        if na and nb:
+            _, pv = fisher_exact([[ka, na - ka], [kb, nb - kb]])
+            print(f"{name:30s} {ka}/{na} = {ka / na:.0%}  vs  {kb}/{nb} = {kb / nb:.0%}   two-sided exact p = {pv:.3f}")
     return res
 
 
