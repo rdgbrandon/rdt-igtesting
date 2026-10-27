@@ -33,4 +33,11 @@ environment builder; every stage runnable in either environment (`scripts/run_st
 ManiSkill 3.0.1 / SAPIEN 3.0.3. All further RDT experiments use the RDT-era stack (pilot `ENV="rdt_era"`).
 The newer-simulator sensitivity (76% → 42% with no change to policy or protocol) is itself worth a sentence in the paper.
 
-**Next:** confirm this repo's rollout at n=50 on the RDT-era stack, then rerun the pilot there.
+**Confirmed (n=50, same seeds, RDT-era stack):** this repo **39/50 = 78%** (95% CI 65–87%) vs official 38/50 = 76%
+(two-sided exact p=1.0), paper 77.2%. Successes take 57–146 steps; every failure times out at 400.
+
+**Next:** rerun the pilot (`rdt_xai_pilot.ipynb`, `ENV="rdt_era"`) on the reproduced policy.
+
+## Iteration 2 — pilot on the reproduced policy
+
+*(pending)*
