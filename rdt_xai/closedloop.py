@@ -1,6 +1,7 @@
 """Closed-loop causal test: at every policy call, explain the current inputs,
 remove a fraction of patches from what the policy sees (both history frames,
-filled with RDT's "missing camera" colour), and record task success.
+inpainted from the rest of the frame by default, see fill.py; fill="gray" pastes
+RDT's "missing camera" colour as in the pilot), and record task success.
 
 If an attribution method is faithful, removing its top patches should hurt
 success far more than removing random patches, and removing its bottom
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .fill import remove_from_image
 from .rollout import rollout
 
 PATCH, SIG = 14, 384
@@ -30,20 +32,13 @@ def patch_mask_image(sel, size, grid=27):
     return Image.fromarray(m).resize(size, Image.NEAREST)
 
 
-def apply_mask(img, mask_img, color):
-    if img is None:
-        return None
-    out = img.convert("RGB").copy()
-    out.paste(Image.new("RGB", out.size, color), mask=mask_img.resize(out.size, Image.NEAREST))
-    return out
-
-
 class MaskHook:
     """obs_hook for rollout(): mode in {'none', 'top', 'bottom', 'top_abs', 'bottom_abs', 'random'}."""
 
-    def __init__(self, policy, explainer, method="eig", mode="top", frac=0.1, n_evals=8, n_seeds=4, seed=0):
+    def __init__(self, policy, explainer, method="eig", mode="top", frac=0.1, n_evals=8, n_seeds=4, seed=0,
+                 fill="inpaint"):
         self.p, self.ex = policy, explainer
-        self.method, self.mode, self.frac = method, mode, frac
+        self.method, self.mode, self.frac, self.fill = method, mode, frac, fill
         self.n_evals, self.n_seeds, self.seed = n_evals, n_seeds, seed
         self.k = int(round(frac * policy.n_patch))
         self.log = []
@@ -68,15 +63,17 @@ class MaskHook:
         sel[order[:self.k]] = True
         self.log.append(dict(call=ctx["call"], step=ctx["step"], sel=np.flatnonzero(sel).tolist()))
         mask = patch_mask_image(sel, curr_img.size)
-        return apply_mask(prev_img, mask, self.p.bg_color), apply_mask(curr_img, mask, self.p.bg_color)
+        return (remove_from_image(prev_img, mask, self.p.bg_color, self.fill),
+                remove_from_image(curr_img, mask, self.p.bg_color, self.fill))
 
 
-def run_condition(policy, explainer, task, episodes, method, mode, frac, env=None, n_evals=8, verbose=False):
+def run_condition(policy, explainer, task, episodes, method, mode, frac, env=None, n_evals=8, fill="inpaint",
+                  verbose=False):
     rows = []
     for ep in episodes:
-        hook = MaskHook(policy, explainer, method=method, mode=mode, frac=frac, n_evals=n_evals, seed=ep)
+        hook = MaskHook(policy, explainer, method=method, mode=mode, frac=frac, n_evals=n_evals, seed=ep, fill=fill)
         r = rollout(policy, task, ep, env=env, obs_hook=hook)
-        rows.append(dict(task=task, episode=ep, method=method, mode=mode, frac=frac,
+        rows.append(dict(task=task, episode=ep, method=method, mode=mode, frac=frac, fill=fill,
                          success=bool(r["success"]), steps=r["steps"], wall=r["wall"]))
         if verbose:
             print(rows[-1], flush=True)

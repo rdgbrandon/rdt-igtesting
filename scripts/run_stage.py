@@ -20,10 +20,11 @@ DEFAULTS = dict(
     tasks=["PickCube-v1", "StackCube-v1", "PushCube-v1"], n_episodes=16,
     methods=["random", "daam", "gae", "grad", "gxi", "occlusion", "iss", "ig_zero", "ig_bg", "blurig", "eig"],
     n_evals=16, fast=False, b_moments=60, b_stability_moments=24, moments_every=3, moments_per_episode=3,
-    c_moments=30, d_tasks=["PickCube-v1", "StackCube-v1"], d_episodes=10, d_frac=0.10,
-    d_conditions=[["none", "none"], ["eig", "top"], ["eig", "bottom"], ["random", "random"], ["daam", "top"],
-                  ["blurig", "top"], ["eig", "bottom_abs"], ["eig", "top_abs"]],
-    e_moments=8, e_methods=["eig", "ig_bg", "blurig", "grad", "gae", "daam"], f_moments=30,
+    b_fill="inpaint", b_fill_fast=False,
+    c_moments=30, d_tasks=["PickCube-v1", "StackCube-v1"], d_episodes=16, d_frac=0.05, d_fill="inpaint",
+    d_conditions=[["none", "none"], ["random", "random"], ["eig", "top_abs"], ["eig", "bottom_abs"], ["eig", "top"],
+                  ["daam", "top"], ["blurig", "top"]],
+    e_moments=8, e_methods=["eig", "ig_bg", "blurig", "grad", "gae", "daam"], f_moments=30, f_timeline_episodes=8,
     dtype="fp32", obs_mode="rgb", batch=8,
 )
 
@@ -108,7 +109,7 @@ if args.stage == "verify":
     sync(); t0 = time.time(); pol.act("PickCube-v1", ip, ic, q); sync(); t["policy call"] = time.time() - t0
     for m in ("eig", "occlusion", "gae"):
         sync(); t0 = time.time(); ex.explain(cond, m, n_evals=cfg["n_evals"], seed=1); sync(); t[m] = time.time() - t0
-    fm = Faithfulness.fast(pol) if cfg["fast"] else Faithfulness(pol)
+    fm = Faithfulness.fast(pol, fill=cfg["b_fill"]) if cfg["fast"] else Faithfulness(pol, fill=cfg["b_fill"])
     maps = {m: ex.explain(cond, m, n_evals=4, seed=1)["map"] for m in cfg["methods"]}
     sync(); t0 = time.time(); fm.evaluate(cond, ip, ic, maps); sync(); t["faithfulness"] = time.time() - t0
     per_moment = 4 * t["eig"] + t["occlusion"] + 3 * t["gae"] + t["faithfulness"]
@@ -138,15 +139,21 @@ elif args.stage == "B":
                 stability=True, batch=cfg["batch"])
     X.benchmark(pol, B[S:], cfg["methods"], os.path.join(out, "B"), n_evals=cfg["n_evals"], fast=cfg["fast"],
                 stability=False, batch=cfg["batch"])
+    if cfg["b_fill"] != "gray":           # B/ keeps the pilot's grey-fill scores; re-score the same maps
+        X.rescore(pol, os.path.join(out, "B"), os.path.join(out, "B_" + cfg["b_fill"]), os.path.join(out, "A"),
+                  fill=cfg["b_fill"], fast=cfg["b_fill_fast"])
 elif args.stage == "C":
     X.denoise(pol, moments()[:cfg["c_moments"]], os.path.join(out, "C"), n_evals=cfg["n_evals"], batch=cfg["batch"])
 elif args.stage == "D":
+    d_out = os.path.join(out, "D" if cfg["d_fill"] == "gray" else "D_" + cfg["d_fill"])
     X.closed_loop(pol, cfg["d_tasks"], range(cfg["d_episodes"]), [tuple(c) for c in cfg["d_conditions"]],
-                  os.path.join(out, "D"), frac=cfg["d_frac"], n_evals=8, batch=cfg["batch"])
+                  d_out, frac=cfg["d_frac"], n_evals=8, batch=cfg["batch"], fill=cfg["d_fill"])
 elif args.stage == "E":
     X.sanity(pol, moments()[:cfg["e_moments"]], cfg["e_methods"], os.path.join(out, "E"), n_evals=8, batch=cfg["batch"])
 elif args.stage == "F":
     X.language(pol, moments()[:cfg["f_moments"]], os.path.join(out, "F"), n_evals=cfg["n_evals"], batch=cfg["batch"])
+    X.modality_timeline(pol, os.path.join(out, "A"), cfg["tasks"], cfg["f_timeline_episodes"],
+                        os.path.join(out, "F_modality"))
 elif args.stage == "video":
     import imageio
     import matplotlib

@@ -56,15 +56,26 @@ def vulkan():
                 f.write(s)
 
 
+import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 _SYNC_LOCK = threading.Lock()
 
 
-def sync(src, dst):
-    """Copy new/changed files only (Drive is slow with many small files). Stages write each
-    unit's .json last (atomically), so a unit is only skipped on resume once it is complete."""
-    n = 0
+def _copy(ab):
+    try:
+        shutil.copyfile(*ab)
+        return 1
+    except FileNotFoundError:                      # file replaced while walking; next round picks it up
+        return 0
+
+
+def sync(src, dst, workers=16):
+    """Copy new/changed files only. Drive is slow per file, not per byte, so copies run in parallel
+    threads in-process (one `cp` process per file made restoring a pilot take ~10 min). Stages write
+    each unit's .json last (atomically), so a unit is only skipped on resume once it is complete."""
+    jobs = []
     with _SYNC_LOCK:
         for root, _, files in os.walk(src):
             rel = os.path.relpath(root, src)
@@ -75,11 +86,11 @@ def sync(src, dst):
                 a, b = os.path.join(root, f), os.path.join(dst, rel, f)
                 try:
                     if not os.path.exists(b) or os.path.getsize(a) != os.path.getsize(b):
-                        subprocess.run(["cp", a, b])
-                        n += 1
-                except FileNotFoundError:          # file replaced while walking; next round picks it up
+                        jobs.append((a, b))
+                except FileNotFoundError:
                     pass
-    return n
+        with ThreadPoolExecutor(workers) as ex:
+            return sum(ex.map(_copy, jobs))
 
 
 def autosync(src, dst, every=300):
@@ -153,6 +164,41 @@ def download_models():
         if not os.path.exists(f"{DATA}/lang/text_embed_{t}-v1.pt"):
             shutil.copy(p, f"{DATA}/lang/text_embed_{t}-v1.pt")
     print("models ready")
+
+
+def run_stage(py, cfg, stage, out_drive, *extra):
+    """Run one study stage (scripts/run_stage.py) in the chosen environment, streaming its
+    progress, then copy results to Drive. Raises if the stage fails."""
+    env = dict(os.environ, RDT_REPO=RDT_REPO, RDT_DATA=DATA)
+    p = subprocess.Popen([py, "scripts/run_stage.py", "--config", cfg, "--stage", stage, *extra], cwd=REPO, env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail = []
+    for line in p.stdout:
+        tail = (tail + [line])[-40:]
+        if "warn" not in line.lower():
+            print(line.rstrip(), flush=True)
+    code = p.wait()
+    print("synced", sync(OUT, out_drive), "files to Drive")
+    if code != 0:
+        raise RuntimeError(f"stage {stage} failed (exit {code}); last output:\n" + "".join(tail))
+
+
+FIGURES = ("fig_faithfulness_curves", "fig_faithfulness_curves_gray", "fig_qualitative", "fig_denoising_steps",
+           "fig_denoising_step_maps", "fig_closed_loop", "fig_sanity", "fig_word_joint", "fig_modality")
+
+
+def show_report(out, out_drive=None):
+    """Build the tables and figures, show them in the notebook, and copy them to Drive."""
+    from IPython.display import Image, Markdown, display
+    from rdt_xai.report import build_report
+    display(Markdown(build_report(out)))
+    for f in FIGURES:
+        path = f"{out}/report/{f}.png"
+        if os.path.exists(path):
+            print(f)
+            display(Image(path, width=900))
+    if out_drive and os.path.abspath(out_drive) != os.path.abspath(out):
+        print("synced", sync(out, out_drive), "files ->", out_drive)
 
 
 PAPER = {"PickCube-v1": 0.772, "StackCube-v1": 0.74, "PushCube-v1": 1.0, "PegInsertionSide-v1": 0.132,

@@ -119,7 +119,7 @@ check("modality Shapley efficiency", abs(sum(mod.values()) - eff) < 1e-3 * max(1
       f"sum={sum(mod.values()):.4f} vs {eff:.4f}  {({k: round(v, 3) for k, v in mod.items()})}")
 
 print("faithfulness")
-for fm, tag in ((Faithfulness.fast(pol), "fast"), (Faithfulness(pol), "full")):
+for fm, tag in ((Faithfulness.fast(pol), "fast"), (Faithfulness(pol), "full"), (Faithfulness.fast(pol, fill="gray"), "fast gray")):
     t1 = time.time()
     res = fm.evaluate(cond, img_p, img_c, {k: maps[k] for k in ("random", "eig", "grad")})
     ok = all(0 <= v["deletion_morf"] <= 3 and np.isfinite(v["insertion"]) for v in res.values())
@@ -144,6 +144,10 @@ X.benchmark(pol, mom, ["random", "daam", "gae", "iss", "eig"], os.path.join(tmp,
             stability=True, verbose=False)
 recs = [json.load(open(f)) for f in glob.glob(os.path.join(tmp, "B", "*.json"))]
 check("benchmark", len(recs) == 2 and "seed_spearman" in recs[0]["methods"]["eig"], f"{time.time()-t1:.1f}s")
+X.rescore(pol, os.path.join(tmp, "B"), os.path.join(tmp, "B_inpaint"), os.path.join(tmp, "A"), fast=True, verbose=False)
+rs = [json.load(open(f)) for f in glob.glob(os.path.join(tmp, "B_inpaint", "*.json"))]
+check("rescore", len(rs) == 2 and all(r["fill"] == "inpaint" and "seed_spearman" in r["methods"]["eig"] for r in rs)
+      and recs[0]["fill"] == "gray", " ".join(f"{m}:{v['deletion_morf']:.2f}" for m, v in rs[0]["methods"].items()))
 X.denoise(pol, mom[:1], os.path.join(tmp, "C"), n_evals=8, verbose=False)
 check("denoise", len(glob.glob(os.path.join(tmp, "C", "*.json"))) == 1)
 X.sanity(pol, mom[:1], ["eig", "daam"], os.path.join(tmp, "E"), n_evals=4, levels=(2, 4), verbose=False)
@@ -151,18 +155,35 @@ s = json.load(open(os.path.join(tmp, "E", "sanity.json")))
 check("sanity", len(s) == 4, " ".join(f"{r['method']}@{r['randomized_blocks']}={r['spearman']:.2f}" for r in s))
 after = pol.sample(cond, noise=noise)
 check("weights restored after sanity", (after - ours).abs().max() < 1e-6)
-for mode in ("top", "bottom", "random"):
-    hk = MaskHook(pol, ex, method="eig", mode=mode, frac=0.1, n_evals=4)
+for mode, fill in (("top", "inpaint"), ("bottom", "inpaint"), ("top_abs", "inpaint"), ("bottom_abs", "inpaint"),
+                   ("random", "inpaint"), ("top", "gray")):
+    hk = MaskHook(pol, ex, method="eig", mode=mode, frac=0.1, n_evals=4, fill=fill)
     mp, mc = hk(img_p, img_c, dict(call=0, step=0, qpos8=q, task=task))
-    frac = (np.asarray(mc) != np.asarray(img_c)).any(-1).mean()
-    check(f"mask hook {mode:6s}", 0.05 < frac < 0.15 and mp is not None, f"masked pixel fraction={frac:.3f}")
+    changed = (np.asarray(mc) != np.asarray(img_c)).any(-1)
+    ok = 0.05 < changed.mean() < 0.15 and mp is not None
+    if fill == "gray":
+        ok = ok and (np.asarray(mc)[changed] == np.array(pol.bg_color)).all()
+    check(f"mask hook {mode:10s} {fill:7s}", ok, f"masked pixel fraction={changed.mean():.3f}")
 
 X.language(pol, mom[:1], os.path.join(tmp, "F"), n_evals=8, verbose=False)
 check("language stage", len(glob.glob(os.path.join(tmp, "F", "*.json"))) == 1)
+X.modality_timeline(pol, os.path.join(tmp, "A"), [task], 1, os.path.join(tmp, "F_modality"), verbose=False)
+tl = [json.load(open(f)) for f in glob.glob(os.path.join(tmp, "F_modality", "*.json"))]
+check("modality timeline", len(tl) == 1 and len(tl[0]["calls"]) == 3)
+# closed-loop rows with 0/n and n/n successes: Wilson bounds must not cross the point estimate
+os.makedirs(os.path.join(tmp, "D_inpaint"))
+for cond, succ in ((("none", "none"), True), (("random", "random"), False), (("eig", "top_abs"), False),
+                   (("eig", "bottom_abs"), True)):
+    for ep in range(6):
+        json.dump(dict(task=task, episode=ep, method=cond[0], mode=cond[1], frac=0.05, fill="inpaint",
+                       success=succ, steps=100, wall=1.0),
+                  open(os.path.join(tmp, "D_inpaint", f"{task}_{cond[0]}-{cond[1]}-5_ep{ep:03d}.json"), "w"))
 from rdt_xai.report import build_report  # noqa: E402
 txt = build_report(tmp)
 figs = sorted(os.path.basename(f) for f in glob.glob(os.path.join(tmp, "report", "*.png")))
-check("report", "Faithfulness" in txt and "Modality" in txt and "fig_word_joint.png" in figs, " ".join(figs))
+check("report", "Faithfulness" in txt and "Modality" in txt and "fig_word_joint.png" in figs
+      and "fig_closed_loop.png" in figs and "fig_faithfulness_curves_gray.png" in figs and "peak_morf" in txt
+      and "inpaint fill" in txt and "every decision" in txt, " ".join(figs))
 
 if args.rollout:
     print("rollout")

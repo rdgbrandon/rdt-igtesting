@@ -3,13 +3,18 @@
 All perturbations happen in PIXEL space on the SigLIP input (both external
 history frames, same patches), and are re-encoded by SigLIP - so no method is
 favoured by sharing the metric's perturbation (as embedding-space metrics
-would favour embedding-space baselines). The removal value is RDT's own
-"missing camera" colour (SigLIP image_mean), i.e. normalized pixel ~0.
+would favour embedding-space baselines). Removing every patch gives RDT's
+own "missing camera" image (SigLIP image_mean, normalized pixel ~0).
 
 Effect size is the L2 deviation of the executed, normalized 8-joint plan from
 the unperturbed plan, averaged over EVALUATION noise seeds that are disjoint
 from the seeds used to compute the explanation, and normalized by the
 deviation when the whole view is removed, D_full.
+
+Removed patches are inpainted from the remaining pixels by default (fill.py);
+fill="gray" pastes the "missing camera" colour instead (the pilot's metric). Grey
+squares are out of distribution: in the pilot, removing 5% of patches that way
+moved the plan ~2x more than removing the whole view, for every method alike.
 
   deletion (MoRF)   remove most-relevant patches first; AUC of D(f)/D_full      higher = better
   deletion (LeRF)   remove least-relevant first;                                lower  = better
@@ -23,6 +28,8 @@ import numpy as np
 import torch
 from scipy.stats import spearmanr
 
+from .fill import remove_pixels
+
 FRACS_FULL = (0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
 FRACS_FAST = (0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
 PATCH = 14
@@ -34,8 +41,10 @@ def _auc(y, x):
 
 
 class Faithfulness:
-    def __init__(self, policy, eval_seeds=(101, 202), fracs=FRACS_FULL, curves=("morf", "lerf", "ins"), batch=10):
+    def __init__(self, policy, eval_seeds=(101, 202), fracs=FRACS_FULL, curves=("morf", "lerf", "ins"), batch=10,
+                 fill="inpaint"):
         self.p = policy
+        self.fill = fill
         self.eval_seeds = list(eval_seeds)
         self.fracs = np.asarray(fracs, dtype=np.float64)
         self.curves = tuple(curves)
@@ -44,8 +53,8 @@ class Faithfulness:
             self.bg_pix = policy.preprocess([policy.bg_image])[0]          # (3, 384, 384)
 
     @classmethod
-    def fast(cls, policy, batch=10):
-        return cls(policy, eval_seeds=(101,), fracs=FRACS_FAST, curves=("morf", "ins"), batch=batch)
+    def fast(cls, policy, batch=10, fill="inpaint"):
+        return cls(policy, eval_seeds=(101,), fracs=FRACS_FAST, curves=("morf", "ins"), batch=batch, fill=fill)
 
     def _patch_mask(self, order, k):
         """Boolean (384,384) pixel mask covering the first k patches in `order`."""
@@ -89,7 +98,7 @@ class Faithfulness:
         d_full = max(float(dev(end[1:2])[0]), 1e-8)
 
         # every (method, curve, interior k) perturbation in one batched pass
-        jobs, pp, pc = [], [], []
+        jobs, masks = [], []
         for name, m in maps.items():
             score = torch.as_tensor(np.asarray(m, dtype=np.float32).reshape(-1))
             orders = {"morf": torch.argsort(score, descending=True), "lerf": torch.argsort(score)}
@@ -97,12 +106,14 @@ class Faithfulness:
             for cv in self.curves:
                 for k in inner:
                     M = self._patch_mask(orders[cv], k)
-                    if cv == "ins":
-                        M = ~M
-                    pp.append(torch.where(M, self.bg_pix, x_prev))
-                    pc.append(torch.where(M, self.bg_pix, x_curr))
+                    masks.append(~M if cv == "ins" else M)
                     jobs.append((name, cv))
-        d = dev(self._plans(cond, torch.stack(pp), torch.stack(pc))) / d_full if jobs else []
+        d = []
+        if jobs:
+            M = torch.stack(masks)[:, None]
+            pp = remove_pixels(x_prev, M, self.bg_pix, self.fill)
+            pc = remove_pixels(x_curr, M, self.bg_pix, self.fill)
+            d = dev(self._plans(cond, pp, pc)) / d_full
 
         res = {name: dict(d_full=d_full) for name in maps}
         it = iter(d)

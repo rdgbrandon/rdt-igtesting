@@ -38,6 +38,35 @@ The newer-simulator sensitivity (76% → 42% with no change to policy or protoco
 
 **Next:** rerun the pilot (`rdt_xai_pilot.ipynb`, `ENV="rdt_era"`) on the reproduced policy.
 
-## Iteration 2 — pilot on the reproduced policy
+## Iteration 2 — pilot on the reproduced policy (Oct 27, 2026)
+
+**Ran:** `rdt_xai_pilot.ipynb`, `ENV="rdt_era"`, output `pilot2`: 16 episodes/task, B 30 moments (fast curves),
+C 15, D 6 episodes/condition at 10% grey patches, E 8, F 15.
+
+**Showed:**
+* **Policy reproduces:** PickCube 12/16 = 75%, StackCube 13/16 = 81%, PushCube 16/16 = 100%.
+* **Denoising time (C), clean:** vision acts almost only in the last two of 5 steps: Expected-IG share 0.08 / 0.05 /
+  0.06 / 0.23 / 0.59; plan change when vision is removed at one step 0.05 / 0.05 / 0.05 / 0.12 / 0.61.
+* **Sanity (E), clean:** Spearman to the trained-model map after re-initializing 7 blocks: Expected IG 0.05,
+  IG (bg) 0.07, BlurIG 0.08 vs DAAM 0.97, GAE 0.90, Gradient 0.88.
+* **Faithfulness (B), not usable as is:** deletion AUC Expected IG 1.68 [0.97, 2.85], best mean but paired Wilcoxon
+  significant only vs Random, ISS, Occlusion. Every method's deletion curve peaks at ~2.0-2.2 x the whole-view
+  deviation after removing 5% of patches: grey squares are out of distribution, so the AUC mostly scores the
+  artifact.
+* **Closed loop (D), not usable as is:** 10% grey patches - top patches of every method 0/6; random already breaks
+  StackCube (6/6 -> 2/6); no sign test significant.
+* **Modality (F):** proprioception carries 53-71% of the Shapley share; the time plot had 2-3 points per task.
+* `build_report` crashed on 0/6 conditions (Wilson bound rounding gave a negative error bar).
+
+**Changed:**
+* Patch removal is now **inpainted** from the remaining pixels (push-pull, `rdt_xai/fill.py`) in the metrics and
+  the closed-loop test; full removal is still RDT's grey "missing camera" image. Stage B re-scores the saved maps
+  into `B_inpaint/` (no re-explaining; `B/` keeps the grey scores) and the report compares the two fills.
+* D: 5% of patches, 16 episodes, conditions none / random / eig top_abs / eig bottom_abs / eig top / DAAM top /
+  BlurIG top, into `D_inpaint/`.
+* F: modality Shapley at every decision of 8 successful episodes per task (`F_modality/`).
+* Report: Wilson fix; one-cell notebook `rdt_xai_run_all.ipynb`; parallel Drive sync.
+
+## Iteration 3 — inpainted removal, extended B/C/D/F
 
 *(pending)*

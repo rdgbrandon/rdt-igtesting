@@ -6,8 +6,10 @@ that already exist, so an interrupted session resumes where it stopped.
   A  rollouts         closed-loop episodes, official protocol, decision points saved
   B  benchmark        all attribution methods at matched compute + pixel faithfulness
                       (+ seed stability on a subset)
+     rescore          faithfulness of the saved B maps under another removal fill
   C  denoise          when during denoising does vision matter: eig split by step + knockout
   D  closed_loop      success rate when top / bottom / random patches are hidden online
+     modality_timeline vision / language / state Shapley at every decision of whole episodes
   E  sanity           cascading model-parameter randomization (Adebayo et al. 2018)
   F  language         word x joint attribution (word removal + IG) and vision/language/state Shapley
 """
@@ -94,10 +96,10 @@ def _cond(pol, meta, c):
 
 # ── B ─────────────────────────────────────────────────────────────────────────
 def benchmark(pol, moments, methods, out, n_evals=16, n_seeds=4, fast=False, stability=False,
-              batch=8, joints=None, verbose=True):
+              batch=8, joints=None, fill="gray", verbose=True):
     os.makedirs(out, exist_ok=True)
     ex = Explainer(pol, joints=joints, batch=batch)
-    fm = Faithfulness.fast(pol) if fast else Faithfulness(pol)
+    fm = Faithfulness.fast(pol, fill=fill) if fast else Faithfulness(pol, fill=fill)
     occ = 4 if fast else 3
     cache = {}
     for d, c in moments:
@@ -125,12 +127,50 @@ def benchmark(pol, moments, methods, out, n_evals=16, n_seeds=4, fast=False, sta
         ff = fm.evaluate(cond, dp["prev"], dp["curr"], maps)
         for m in methods:
             rec["methods"][m].update(ff[m])
-        rec["seconds_explain"], rec["seconds_faith"] = t1 - t0, time.time() - t1
+        rec["seconds_explain"], rec["seconds_faith"], rec["fill"] = t1 - t0, time.time() - t1, fill
         np.savez_compressed(os.path.join(out, tag + ".npz"), **maps)
         _dump(path, rec)
         if verbose:
             best = sorted(methods, key=lambda m: -ff[m]["deletion_morf"])[:3]
             print(f"{tag}  explain {t1-t0:5.1f}s  faith {time.time()-t1:5.1f}s  top deletion: "
+                  + ", ".join(f"{m}={ff[m]['deletion_morf']:.2f}" for m in best), flush=True)
+
+
+_FAITH_KEYS = ("d_full", "deletion_morf", "deletion_lerf", "insertion", "morf_minus_lerf",
+               "curve_morf", "curve_lerf", "curve_ins")
+
+
+def rescore(pol, src, out, rollout_dir, fill="inpaint", fast=False, verbose=True):
+    """Faithfulness of the maps `benchmark` saved in `src` under another removal fill, without
+    recomputing the explanations: each record is copied with its faithfulness metrics replaced."""
+    os.makedirs(out, exist_ok=True)
+    fm = Faithfulness.fast(pol, fill=fill) if fast else Faithfulness(pol, fill=fill)
+    cache = {}
+    for f in sorted(glob.glob(os.path.join(src, "*.json"))):
+        tag = os.path.basename(f)[:-5]
+        path, npz = os.path.join(out, tag + ".json"), os.path.join(src, tag + ".npz")
+        if os.path.exists(path) or not os.path.exists(npz):
+            continue
+        with open(f) as fh:
+            rec = json.load(fh)
+        ep, c = tag.rsplit("_call", 1)
+        d = os.path.join(rollout_dir, ep)
+        if d not in cache:
+            cache = {d: load_episode(d)}
+        dp, cond = _cond(pol, cache[d], int(c))
+        z = np.load(npz)
+        maps = {m: z[m] for m in rec["methods"] if m in z.files}
+        t0 = time.time()
+        ff = fm.evaluate(cond, dp["prev"], dp["curr"], maps)
+        for m, v in rec["methods"].items():
+            for k in _FAITH_KEYS:
+                v.pop(k, None)
+            v.update(ff.get(m, {}))
+        rec["seconds_faith"], rec["fill"], rec["faith_fast"] = time.time() - t0, fill, fast
+        _dump(path, rec)
+        if verbose:
+            best = sorted(maps, key=lambda m: -ff[m]["deletion_morf"])[:3]
+            print(f"{tag}  {fill} faith {time.time()-t0:5.1f}s  top deletion: "
                   + ", ".join(f"{m}={ff[m]['deletion_morf']:.2f}" for m in best), flush=True)
 
 
@@ -164,7 +204,8 @@ def denoise(pol, moments, out, n_evals=16, n_seeds=4, batch=8, verbose=True):
 
 
 # ── D ─────────────────────────────────────────────────────────────────────────
-def closed_loop(pol, tasks, episodes, conditions, out, frac=0.1, n_evals=8, batch=8, render_backend=None, verbose=True):
+def closed_loop(pol, tasks, episodes, conditions, out, frac=0.1, n_evals=8, batch=8, render_backend=None,
+                fill="inpaint", verbose=True):
     """conditions: list of (method, mode), e.g. [('none','none'), ('eig','top'), ('random','random')]."""
     os.makedirs(out, exist_ok=True)
     ex = Explainer(pol, batch=batch)
@@ -175,10 +216,10 @@ def closed_loop(pol, tasks, episodes, conditions, out, frac=0.1, n_evals=8, batc
                 path = os.path.join(out, f"{task}_{method}-{mode}-{int(frac*100)}_ep{ep:03d}.json")
                 if os.path.exists(path):
                     continue
-                row = run_condition(pol, ex, task, [ep], method, mode, frac, env=env, n_evals=n_evals)[0]
+                row = run_condition(pol, ex, task, [ep], method, mode, frac, env=env, n_evals=n_evals, fill=fill)[0]
                 _dump(path, row)
                 if verbose:
-                    print(f"{task:16s} {method:7s} {mode:6s} ep{ep:03d} success={row['success']!s:5} "
+                    print(f"{task:16s} {method:7s} {mode:10s} ep{ep:03d} success={row['success']!s:5} "
                           f"steps={row['steps']:3d} {row['wall']:6.1f}s", flush=True)
         env.close()
 
@@ -259,3 +300,27 @@ def language(pol, moments, out, n_evals=16, batch=8, verbose=True):
             print(f"{tag}  vision/lang/state share {mod['vision']/tot:.2f}/{mod['language']/tot:.2f}/"
                   f"{mod['state']/tot:.2f}  most important word: '{top}'  IG~drop rho={np.nanmean(agree):.2f}  "
                   f"{time.time()-t0:.1f}s", flush=True)
+
+
+def modality_timeline(pol, rollout_dir, tasks, n_episodes, out, verbose=True):
+    """Vision / language / state Shapley shares at every decision of the first `n_episodes`
+    successful episodes per task (8 sampler calls per seed), for reliance over the episode."""
+    os.makedirs(out, exist_ok=True)
+    lx = LanguageExplainer(pol)
+    for task in tasks:
+        eps = sorted({d for d, _ in select_moments(rollout_dir, tasks=[task], every=1, max_per_episode=10 ** 6)})
+        for d in eps[:n_episodes]:
+            path = os.path.join(out, os.path.basename(d) + ".json")
+            if os.path.exists(path):
+                continue
+            meta, rows, t0 = load_episode(d), [], time.time()
+            for c in range(meta["n_calls"]):
+                dp, cond = _cond(pol, meta, c)
+                seed = dp["seed"] % 100000
+                rows.append(dict(call=c, step=dp["step"], **lx.modality(cond, seeds=(seed, seed + 1))))
+            _dump(path, dict(task=meta["task"], episode=meta["episode"], n_calls=meta["n_calls"], calls=rows))
+            if verbose:
+                v = np.array([[abs(r[k]) for k in ("vision", "language", "state")] for r in rows])
+                v = v / (v.sum(1, keepdims=True) + 1e-12)
+                print(f"{os.path.basename(d)}  {len(rows)} decisions  vision share first/last "
+                      f"{v[0, 0]:.2f}/{v[-1, 0]:.2f}  {time.time()-t0:.1f}s", flush=True)

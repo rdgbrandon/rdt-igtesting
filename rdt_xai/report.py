@@ -41,12 +41,18 @@ def _wilson(k, n, z=1.96):
     d = 1 + z * z / n
     c = (p + z * z / (2 * n)) / d
     h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-    return p, c - h, c + h
+    return p, min(p, max(0.0, c - h)), max(p, min(1.0, c + h))      # rounding can put c - h above p = 0
 
 
-def load_benchmark(out):
+def bench_dir(out):
+    """Faithfulness scores to report: the inpainting re-score if present, else the pilot's grey fill."""
+    d = os.path.join(out, "B_inpaint")
+    return d if glob.glob(os.path.join(d, "*.json")) else os.path.join(out, "B")
+
+
+def load_benchmark(bdir):
     rows = []
-    for f in glob.glob(os.path.join(out, "B", "*.json")):
+    for f in glob.glob(os.path.join(bdir, "*.json")):
         r = json.load(open(f))
         for m, v in r["methods"].items():
             rows.append(dict(moment=r["moment"], task=r["task"], call=r["call"], step=r["step"],
@@ -82,14 +88,41 @@ def benchmark_tables(df, ref="eig"):
     return t, pd.DataFrame(tests)
 
 
-def plot_curves(out, figdir):
+def load_curves(bdir):
     curves = {}
-    for f in glob.glob(os.path.join(out, "B", "*.json")):
+    for f in glob.glob(os.path.join(bdir, "*.json")):
         r = json.load(open(f))
         for m, v in r["methods"].items():
             for cv in ("curve_morf", "curve_ins"):
                 if cv in v:
                     curves.setdefault((m, cv), []).append(v[cv])
+    return curves
+
+
+def fill_comparison(out):
+    """Pilot grey fill vs inpainting on the same maps and moments. `peak_morf` is the mean over moments
+    of max D(f)/D_full along the deletion curve: above 1, removing part of the view moved the plan more
+    than removing all of it (an out-of-distribution input, not evidence about the method)."""
+    rows = {}
+    for fill, sub in (("gray", "B"), ("inpaint", "B_inpaint")):
+        df = load_benchmark(os.path.join(out, sub))
+        if not len(df):
+            return None
+        for m, g in df.groupby("method"):
+            rows.setdefault(m, {"method": LABEL.get(m, m)})
+            rows[m][f"deletion_{fill}"] = g.deletion_morf.mean()
+            rows[m][f"insertion_{fill}"] = g.insertion.mean()
+        for (m, cv), ys in load_curves(os.path.join(out, sub)).items():
+            if cv == "curve_morf":
+                rows[m][f"peak_morf_{fill}"] = np.mean([max(y) for y in ys])
+    t = pd.DataFrame(rows.values()).sort_values("deletion_inpaint", ascending=False)
+    for fill in ("gray", "inpaint"):
+        t[f"rank_{fill}"] = t[f"deletion_{fill}"].rank(ascending=False).astype(int)
+    return t
+
+
+def plot_curves(bdir, figdir, name="fig_faithfulness_curves", note=""):
+    curves = load_curves(bdir)
     if not curves:
         return
     from .metrics import FRACS_FAST, FRACS_FULL
@@ -101,21 +134,22 @@ def plot_curves(out, figdir):
                 continue
             Y = np.array(ys)
             x = np.array(FRACS_FULL if Y.shape[1] == len(FRACS_FULL) else FRACS_FAST)
-            ax.plot(x, Y.mean(0), "-o", ms=3, lw=2.5 if m == "eig" else 1.2, label=LABEL.get(m, m),
+            ax.plot(x, Y.mean(0), marker="o", ms=3, lw=2.5 if m == "eig" else 1.2, label=LABEL.get(m, m),
                     color="k" if m == "random" else None, ls="--" if m == "random" else "-")
         ax.set_xlabel("fraction of patches removed" if cv == "curve_morf" else "fraction of patches revealed")
         ax.set_ylabel("plan deviation / full-removal deviation" if cv == "curve_morf" else "1 - normalized deviation")
-        ax.set_title(title, fontsize=9)
+        ax.set_title(title + note, fontsize=9)
         ax.grid(alpha=.3)
+    axes[0].axhline(1, color="0.5", lw=0.8, ls=":")                       # = whole view removed
     axes[1].legend(fontsize=7, loc="lower right")
     fig.tight_layout()
-    fig.savefig(os.path.join(figdir, "fig_faithfulness_curves.png"), dpi=150)
+    fig.savefig(os.path.join(figdir, name + ".png"), dpi=150)
     plt.close(fig)
 
 
-def plot_qualitative(out, rollout_dir, figdir, methods=("daam", "gae", "iss", "blurig", "eig"), n=6):
+def plot_qualitative(bdir, rollout_dir, figdir, methods=("daam", "gae", "iss", "blurig", "eig"), n=6):
     from PIL import Image
-    files = sorted(glob.glob(os.path.join(out, "B", "*.npz")))
+    files = sorted(glob.glob(os.path.join(bdir, "*.npz")))
     if not files:
         return
     pick = [files[int(i)] for i in np.linspace(0, len(files) - 1, min(n, len(files)))]
@@ -186,10 +220,19 @@ def denoise_report(out, figdir):
 
 
 def closed_loop_report(out, figdir):
-    rows = [json.load(open(f)) for f in glob.glob(os.path.join(out, "D", "*.json"))]
+    """Reports D_inpaint (current protocol) if present, else the pilot's grey-fill D."""
+    rows = []
+    for sub in ("D_inpaint", "D"):
+        rows = [json.load(open(f)) for f in glob.glob(os.path.join(out, sub, "*.json"))]
+        if rows:
+            break
     if not rows:
-        return None, None
+        return None, None, None
     df = pd.DataFrame(rows)
+    if "fill" not in df:
+        df["fill"] = "gray"
+    desc = ", ".join(f"{100 * fr:g}% of patches hidden, {fl} fill"
+                     for fr, fl in sorted(set(zip(df["frac"], df["fill"]))))
     df["condition"] = df["method"] + ":" + df["mode"]
     tab = []
     for (task, cond), g in df.groupby(["task", "condition"]):
@@ -200,8 +243,9 @@ def closed_loop_report(out, figdir):
     tests = []
     for task, g in df.groupby("task"):
         P = g.pivot_table(index="episode", columns="condition", values="success", aggfunc="first")
-        for a, b in (("random:random", "eig:top"), ("eig:bottom", "eig:top"), ("random:random", "daam:top"),
-                     ("eig:bottom_abs", "eig:top_abs"), ("random:random", "eig:bottom_abs")):
+        for a, b in (("random:random", "eig:top_abs"), ("eig:bottom_abs", "eig:top_abs"),
+                     ("random:random", "eig:top"), ("random:random", "daam:top"), ("random:random", "blurig:top"),
+                     ("none:none", "eig:bottom_abs"), ("none:none", "random:random"), ("eig:bottom", "eig:top")):
             if a in P and b in P:
                 x = P[[a, b]].dropna().astype(bool)
                 n10, n01 = int((x[a] & ~x[b]).sum()), int((~x[a] & x[b]).sum())
@@ -217,12 +261,12 @@ def closed_loop_report(out, figdir):
                       for c in conds])
         ax.set_xticks(range(len(conds)), [c.replace(":", "\n") for c in conds], fontsize=7)
         ax.set_ylim(0, 1)
-        ax.set_title(f"{task}: success with 10% of patches hidden", fontsize=9)
+        ax.set_title(f"{task}: success, {desc}", fontsize=8)
         ax.grid(axis="y", alpha=.3)
     fig.tight_layout()
     fig.savefig(os.path.join(figdir, "fig_closed_loop.png"), dpi=150)
     plt.close(fig)
-    return tab, pd.DataFrame(tests)
+    return tab, pd.DataFrame(tests), desc
 
 
 def sanity_report(out, figdir):
@@ -267,26 +311,45 @@ def language_report(out, figdir):
     fig.savefig(os.path.join(figdir, "fig_word_joint.png"), dpi=150)
     plt.close(fig)
 
-    df = pd.DataFrame([dict(task=r["task"], phase=r["call"] / max(1, r["n_calls"] - 1), **r["modality"],
-                            ig_drop_spearman=np.nanmean(r["ig_drop_spearman"]),
-                            ig_completeness=np.mean(r["ig_completeness_rel_err"])) for r in recs])
-    tot = df[["vision", "language", "state"]].abs().sum(1) + 1e-12
-    for k in ("vision", "language", "state"):
-        df[k + "_share"] = df[k].abs() / tot
+    df = _shares(pd.DataFrame([dict(task=r["task"], phase=r["call"] / max(1, r["n_calls"] - 1), **r["modality"],
+                                    ig_drop_spearman=np.nanmean(r["ig_drop_spearman"]),
+                                    ig_completeness=np.mean(r["ig_completeness_rel_err"])) for r in recs]))
+    summ = df.groupby("task")[["vision_share", "language_share", "state_share", "ig_drop_spearman", "ig_completeness"]].mean()
+    # reliance over the episode: every decision of whole episodes (F_modality) if present, else the F moments
+    tl = [json.load(open(f)) for f in glob.glob(os.path.join(out, "F_modality", "*.json"))]
+    if tl:
+        df_t = _shares(pd.DataFrame([dict(task=e["task"], episode=e["episode"], phase=c["call"] / max(1, e["n_calls"] - 1),
+                                          **{k: c[k] for k in ("vision", "language", "state")})
+                                     for e in tl for c in e["calls"]]))
+        timeline = df_t.groupby("task")[["vision_share", "language_share", "state_share"]].mean()
+        timeline.insert(0, "episodes", df_t.groupby("task").episode.nunique())
+        timeline.insert(1, "decisions", df_t.groupby("task").size())
+    else:
+        df_t, timeline = df, None
+    nb = 8 if tl else 4
     fig, axes = plt.subplots(1, len(tasks), figsize=(4.5 * len(tasks), 3.3), squeeze=False)
     for ax, task in zip(axes[0], tasks):
-        g = df[df.task == task].sort_values("phase")
-        bins = np.clip((g.phase * 4).astype(int), 0, 3)
+        g = df_t[df_t.task == task]
+        bins = np.clip((g.phase * nb).astype(int), 0, nb - 1)
         m = g.groupby(bins)[["vision_share", "language_share", "state_share"]].mean()
-        ax.stackplot(m.index / 4 + 0.125, m.T.values, labels=["vision", "language", "proprioception"], alpha=.85)
+        x = (m.index.values + 0.5) / nb
+        ax.stackplot(x, m.T.values, labels=["vision", "language", "proprioception"], alpha=.85)
+        ax.plot(x, m.vision_share, "o", ms=3, color="k")                    # where the bins actually are
         ax.set_xlim(0, 1), ax.set_ylim(0, 1)
-        ax.set_xlabel("episode progress"), ax.set_title(f"{task}: modality reliance (Shapley share)", fontsize=8)
+        ax.set_xlabel("episode progress")
+        ax.set_title(f"{task}: modality reliance (Shapley share), {len(g)} decisions", fontsize=8)
     axes[0][0].legend(fontsize=7, loc="lower left")
     fig.tight_layout()
     fig.savefig(os.path.join(figdir, "fig_modality.png"), dpi=150)
     plt.close(fig)
-    summ = df.groupby("task")[["vision_share", "language_share", "state_share", "ig_drop_spearman", "ig_completeness"]].mean()
-    return summ, df
+    return summ, timeline
+
+
+def _shares(df):
+    tot = df[["vision", "language", "state"]].abs().sum(1) + 1e-12
+    for k in ("vision", "language", "state"):
+        df[k + "_share"] = df[k].abs() / tot
+    return df
 
 
 def build_report(out, rollout_dir=None):
@@ -303,7 +366,9 @@ def build_report(out, rollout_dir=None):
         s.to_csv(os.path.join(figdir, "A_success.csv"))
         md += ["## A. Policy success (official protocol)\n", s.to_markdown(floatfmt=".2f"), "\n"]
 
-    df = load_benchmark(out)
+    bdir = bench_dir(out)
+    fill = "inpainted" if bdir.endswith("_inpaint") else 'grey ("missing camera" colour)'
+    df = load_benchmark(bdir)
     if len(df):
         t, tests = benchmark_tables(df)
         cols = ["method", "n"] + [c for c in ("deletion_morf", "insertion", "morf_minus_lerf", "seed_spearman",
@@ -311,23 +376,32 @@ def build_report(out, rollout_dir=None):
         t[cols].to_csv(os.path.join(figdir, "B_faithfulness.csv"), index=False)
         tests.to_csv(os.path.join(figdir, "B_paired_tests.csv"), index=False)
         md += ["## B. Faithfulness at matched compute (mean [95% bootstrap CI] over moments)\n",
+               f"Removed patches are {fill}.\n\n",
                t[cols].to_markdown(index=False), "\n",
                "Paired Wilcoxon tests, Expected IG minus each method (positive = ours better):\n",
                tests.to_markdown(index=False, floatfmt=".3g"), "\n"]
         per_task = df.pivot_table(index="method", columns="task", values="deletion_morf").rename(index=LABEL)
         md += ["Deletion AUC by task:\n", per_task.to_markdown(floatfmt=".3f"), "\n"]
-        plot_curves(out, figdir)
-        plot_qualitative(out, rollout_dir, figdir)
+        plot_curves(bdir, figdir, note=f"  [{fill.split()[0]} fill]")
+        plot_qualitative(os.path.join(out, "B"), rollout_dir, figdir)
+        fc = fill_comparison(out) if bdir.endswith("_inpaint") else None
+        if fc is not None:
+            plot_curves(os.path.join(out, "B"), figdir, name="fig_faithfulness_curves_gray", note="  [grey fill]")
+            fc.to_csv(os.path.join(figdir, "B_fill_comparison.csv"), index=False)
+            md += ["Same maps, grey fill (pilot metric) vs inpainting. `peak_morf` = mean max of D(f)/D_full along "
+                   "the deletion curve; above 1, removing part of the view moved the plan more than removing all "
+                   "of it, i.e. the score reflects an out-of-distribution input rather than the method:\n",
+                   fc.to_markdown(index=False, floatfmt=".3f"), "\n"]
 
     dn = denoise_report(out, figdir)
     if dn is not None:
         dn.to_csv(os.path.join(figdir, "C_denoising.csv"), index=False)
         md += ["## C. When during denoising does vision matter?\n", dn.to_markdown(index=False, floatfmt=".3f"), "\n"]
 
-    cl, cl_tests = closed_loop_report(out, figdir)
+    cl, cl_tests, cl_desc = closed_loop_report(out, figdir)
     if cl is not None:
         cl.to_csv(os.path.join(figdir, "D_closed_loop.csv"), index=False)
-        md += ["## D. Closed-loop: success with 10% of patches hidden online (Wilson 95% CI)\n",
+        md += [f"## D. Closed-loop: success with patches hidden online ({cl_desc}; Wilson 95% CI)\n",
                cl.to_markdown(index=False, floatfmt=".2f"), "\n",
                "`top`/`bottom` rank patches by the signed score (so `eig:bottom` hides the most *negative* patches); "
                "`top_abs`/`bottom_abs` rank by magnitude (`bottom_abs` = least relevant patches).\n\n",
@@ -339,12 +413,19 @@ def build_report(out, rollout_dir=None):
         md += ["## E. Model-randomization sanity check (Spearman to trained-model map)\n",
                sn.rename(index=LABEL).to_markdown(floatfmt=".2f"), "\n"]
 
-    lg, _ = language_report(out, figdir)
+    lg, tl = language_report(out, figdir)
     if lg is not None:
         lg.to_csv(os.path.join(figdir, "F_language.csv"))
         md += ["## F. Modality reliance (Shapley share) and word attribution consistency\n",
                lg.to_markdown(floatfmt=".3f"), "\n",
-               "`ig_drop_spearman`: per-joint rank agreement between |word IG| and word-removal effect.\n"]
+               "`ig_drop_spearman`: per-joint rank agreement between |word IG| and word-removal effect. "
+               "Word scores are on RDT's precomputed T5 encoder outputs, which are contextual: a token's score "
+               "can carry information from the whole sentence (e.g. \"of\" in \"let go of the cube\"), so they "
+               "are not a clean per-word ablation of the instruction text.\n"]
+        if tl is not None:
+            tl.to_csv(os.path.join(figdir, "F_modality_timeline.csv"))
+            md += ["Modality share over every decision of whole successful episodes:\n",
+                   tl.to_markdown(floatfmt=".3f"), "\n"]
 
     text = "\n".join(md)
     with open(os.path.join(figdir, "RESULTS.md"), "w") as f:
