@@ -24,7 +24,7 @@ Each entry: what ran, what it showed, what changed. Numbers are copied from the 
 | RDT's **official** eval on ManiSkill 3.0.1 | `colab.repro_check`, PickCube, n=10, official seeds | **4/10 = 40%** (paper 77.2%; one-sided exact p=0.015) → the gap is not specific to this repo |
 | RDT-era stack (ManiSkill 3.0.0b15, SAPIEN 3.0.0b1, Py 3.11) | same check, n=10 | official 5/10, this repo 7/10; pooled 2024 sim 12/20 vs current 5/16 (incl. pilot 1/6), p=0.11 → **suggestive, not conclusive**; rerun at n=50 in a 2x2 design |
 | more current-sim data | n=10 this repo 1/10; interrupted n=50 official run 10/24 (episodes 0–23) | current sim clearly below paper; every failure times out at 400 steps, successes take 59–152 steps |
-| Panda gripper controller / SAPIEN renderer changed | diff shows the mimic gripper controller was rewritten; renderer 3.0.0b1 → 3.0.3 | **confirmed cause**: official eval on the Nov-2024 stack, n=50: **38/50 = 76%** (95% CI 63–86%; paper 77.2%) vs 10/24 = 42% on ManiSkill 3.0.1 (exact p≈0.006) |
+| Panda gripper controller / SAPIEN renderer changed | diff shows the mimic gripper controller was rewritten; renderer 3.0.0b1 → 3.0.3 | **confirmed cause**: official eval on the Nov-2024 stack, n=50: **38/50 = 76%** (95% CI 63–86%; paper 77.2%) vs 10/24 = 42% on ManiSkill 3.0.1 (two-sided exact p=0.008) |
 
 **Changed:** bf16 path fixed (timestep embedder dtype); rollouts back to official `obs_mode="rgb"`; RDT-era
 environment builder; every stage runnable in either environment (`scripts/run_stage.py`, pilot `ENV` switch).
