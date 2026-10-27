@@ -23,6 +23,7 @@ ap.add_argument("-n", type=int, default=20)
 ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
 ap.add_argument("--obs", default="rgb", choices=["rgb", "state_dict"])
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--progress", default="", help="jsonl of finished episodes: appended live, skipped on restart")
 args = ap.parse_args()
 if args.dtype == "bf16":
     os.environ["RDT_DTYPE"] = "bf16"
@@ -46,7 +47,27 @@ def versions():
 
 t0 = time.time()
 paths = default_paths()
-succ, steps = [], []
+done_eps = {}
+if args.progress and os.path.exists(args.progress):
+    for line in open(args.progress):
+        if line.strip():
+            r = json.loads(line)
+            done_eps[r["ep"]] = r
+
+
+def record(ep, success, n_steps, resumed=False):
+    done_eps[ep] = dict(ep=ep, success=bool(success), steps=int(n_steps))
+    if args.progress and not resumed:
+        with open(args.progress, "a") as f:
+            f.write(json.dumps(done_eps[ep]) + "\n")
+    print(f"  ep {ep:3d} success={bool(success)} steps={n_steps}" + ("  (saved earlier)" if resumed else ""),
+          file=sys.stderr, flush=True)
+
+
+for ep in sorted(done_eps):
+    if ep < args.n:
+        record(ep, done_eps[ep]["success"], done_eps[ep]["steps"], resumed=True)
+todo = [ep for ep in range(args.n) if ep not in done_eps]
 
 if args.impl == "official":
     # eval_sim/eval_rdt_maniskill.py, verbatim except: T5-XXL is not loaded (the released
@@ -81,7 +102,9 @@ if args.impl == "official":
     text_embed = torch.load(os.path.join(paths["lang_dir"], f"text_embed_{args.task}.pt"))
     MAX_EPISODE_STEPS = 400
     base_seed = 20241201
-    for episode in range(args.n):
+    # note: after a resume the official script's global RNG stream (diffusion noise) differs from an
+    # uninterrupted run; each episode is still a valid independent evaluation on the same seed.
+    for episode in todo:
         obs_window = deque(maxlen=2)
         obs, _ = env.reset(seed=episode + base_seed)
         policy.reset()
@@ -110,20 +133,18 @@ if args.impl == "official":
                         done = True
                         break
         s = info.get("success", False)
-        succ.append(bool(s.item() if hasattr(s, "item") else s))
-        steps.append(global_steps)
-        print(f"  ep {episode:3d} success={succ[-1]} steps={global_steps}", file=sys.stderr, flush=True)
+        record(episode, s.item() if hasattr(s, "item") else s, global_steps)
 else:
     from rdt_xai.policy import RDTPolicy
     from rdt_xai.rollout import make_env, rollout
     pol = RDTPolicy()
     env = make_env(args.task, obs_mode=args.obs)
-    for ep in range(args.n):
+    for ep in todo:
         r = rollout(pol, args.task, ep, env=env)
-        succ.append(bool(r["success"]))
-        steps.append(r["steps"])
-        print(f"  ep {ep:3d} success={succ[-1]} steps={r['steps']}", file=sys.stderr, flush=True)
+        record(ep, r["success"], r["steps"])
 
+res = [done_eps[e] for e in range(args.n)]
+succ, steps = [r["success"] for r in res], [r["steps"] for r in res]
 print("RESULT_JSON " + json.dumps(dict(impl=args.impl, task=args.task, dtype=args.dtype, obs=args.obs if args.impl == "ours" else "rgb",
                       n=len(succ), success_rate=float(np.mean(succ)), mean_steps=float(np.mean(steps)),
                       minutes=(time.time() - t0) / 60, versions=versions())))

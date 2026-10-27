@@ -136,7 +136,9 @@ def _repro_run(tag, python, task, n, extra):
     env = dict(os.environ, RDT_REPO=RDT_REPO, RDT_DATA=DATA)
     # one merged stream: reading stderr and stdout one after the other deadlocks once the
     # child fills the unread pipe (e.g. per-step simulator warnings)
-    p = subprocess.Popen([python, "tests/repro.py", "--task", task, "-n", str(n), *extra], cwd=REPO, env=env,
+    progress = f"{OUT}/repro_{tag}_{task}.progress.jsonl"          # finished episodes survive interruptions
+    p = subprocess.Popen([python, "tests/repro.py", "--task", task, "-n", str(n), "--progress", progress, *extra],
+                         cwd=REPO, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail, result = [], None
     for line in p.stdout:
@@ -163,10 +165,11 @@ def _wilson(k, n, z=1.96):
     return c - h, c + h
 
 
-def repro_check(task="PickCube-v1", n=50):
+def repro_check(task="PickCube-v1", n=50, sims=("current", "2024")):
     """Does RDT reproduce its paper success rate, and with which simulator? 2 x 2 design:
     {official eval code, this repo} x {current ManiSkill 3.0.1, Nov-2024 ManiSkill 3.0.0b15}, same seeds.
-    Prints per-run success with 95% Wilson CIs and pooled exact tests for the simulator and code effects."""
+    Prints per-run success with 95% Wilson CIs and pooled exact tests for the simulator and code effects.
+    sims: which simulators to run; finished episodes are kept across interruptions and reused."""
     from scipy.stats import fisher_exact
     prepare()
     download_models()
@@ -177,6 +180,8 @@ def repro_check(task="PickCube-v1", n=50):
     py = {"current": sys.executable}
     res = {}
     for impl, sim, tag, extra in runs:
+        if sim not in sims:
+            continue
         if sim not in py:
             py[sim] = rdt_era_env()
         res[(impl, sim)] = _repro_run(tag, py[sim], task, n, extra)
