@@ -56,18 +56,51 @@ def vulkan():
                 f.write(s)
 
 
+import threading
+
+_SYNC_LOCK = threading.Lock()
+
+
 def sync(src, dst):
-    """Copy new/changed files only (Drive is slow with many small files)."""
+    """Copy new/changed files only (Drive is slow with many small files). Stages write each
+    unit's .json last (atomically), so a unit is only skipped on resume once it is complete."""
     n = 0
-    for root, _, files in os.walk(src):
-        rel = os.path.relpath(root, src)
-        os.makedirs(os.path.join(dst, rel), exist_ok=True)
-        for f in files:
-            a, b = os.path.join(root, f), os.path.join(dst, rel, f)
-            if not os.path.exists(b) or os.path.getsize(a) != os.path.getsize(b):
-                subprocess.run(["cp", a, b])
-                n += 1
+    with _SYNC_LOCK:
+        for root, _, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            os.makedirs(os.path.join(dst, rel), exist_ok=True)
+            for f in files:
+                if f.endswith(".tmp"):
+                    continue
+                a, b = os.path.join(root, f), os.path.join(dst, rel, f)
+                try:
+                    if not os.path.exists(b) or os.path.getsize(a) != os.path.getsize(b):
+                        subprocess.run(["cp", a, b])
+                        n += 1
+                except FileNotFoundError:          # file replaced while walking; next round picks it up
+                    pass
     return n
+
+
+def autosync(src, dst, every=300):
+    """Copy results to Drive every `every` seconds in the background, so a disconnect
+    loses at most a few minutes of work instead of the stage in progress."""
+    global _AUTOSYNC
+    if globals().get("_AUTOSYNC") and _AUTOSYNC.is_alive():
+        return _AUTOSYNC
+
+    def loop():
+        import time
+        while True:
+            time.sleep(every)
+            try:
+                sync(src, dst)
+            except Exception as e:                 # never kill the run because Drive hiccuped
+                print("autosync:", e)
+    _AUTOSYNC = threading.Thread(target=loop, daemon=True)
+    _AUTOSYNC.start()
+    print(f"autosync to Drive every {every // 60} min")
+    return _AUTOSYNC
 
 
 def prepare():
@@ -100,6 +133,7 @@ def setup(out_drive):
     prepare()
     os.makedirs(out_drive, exist_ok=True)
     print("restored from Drive:", sync(out_drive, OUT), "files")
+    autosync(OUT, out_drive)
     return OUT
 
 
