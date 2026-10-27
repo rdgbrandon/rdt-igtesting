@@ -1,0 +1,29 @@
+# Iteration log
+
+Each entry: what ran, what it showed, what changed. Numbers are copied from the runs, not estimated.
+
+## Iteration 1 — pilot on Colab A100 (Oct 26–27, 2026)
+
+**Ran:** `rdt_xai_pilot.ipynb` (ManiSkill 3.0.1, SAPIEN 3.0.3, Python 3.13, fp32). Measured speed: policy call
+0.18 s, Expected IG (16 evals) 4.2 s, faithfulness for 11 methods 24 s; projected 2.8 h for the full pilot.
+
+**Showed:**
+* **Policy does not reproduce.** PickCube 1/6 = 17% (paper 77.2%), mean 359 of 400 steps; closed-loop control
+  condition 1/8. A first repro run on StackCube (n=8): 4/8 with this pipeline (paper 74%).
+* Attribution tables are therefore not usable (and n = 3 moments: CIs overlap, paired tests undefined).
+* Only robust-looking signal: model-randomization sanity check — gradient / DAAM / GAE maps stay correlated
+  with the trained model's (Spearman 0.6–0.98) after re-initializing RDT blocks; IG-family maps drop to ~0.
+  To be re-checked on a working policy.
+
+**Diagnosis so far:**
+| Hypothesis | Test | Result |
+|---|---|---|
+| diffusers 0.42 scheduler differs from 0.27.2 | identical inputs through both `DPMSolverMultistepScheduler`s | identical timesteps and outputs → ruled out |
+| our pipeline differs from RDT's `step()` | `tests/check_official_step.py`, real checkpoint, identical inputs + noise | max diff 4.8e-7 rad → ruled out |
+| PickCube task / camera / frequencies changed | diff ManiSkill 3.0.0b15 vs 3.0.1 | same camera pose, spawn ranges, 100 Hz sim / 20 Hz control, `auto`→CPU sim |
+| Panda gripper controller / SAPIEN renderer changed | diff shows the mimic gripper controller was rewritten; renderer 3.0.0b1 → 3.0.3 | **open** — tested by `rdt_repro_check.ipynb` (runs 4–5 use the Nov-2024 stack) |
+
+**Changed:** bf16 path fixed (timestep embedder dtype); rollouts back to official `obs_mode="rgb"`; RDT-era
+environment builder; every stage runnable in either environment (`scripts/run_stage.py`, pilot `ENV` switch).
+
+**Next:** read the repro table; run the pilot in whichever environment reproduces ~77% / 74%.
