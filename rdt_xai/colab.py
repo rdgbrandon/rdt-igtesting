@@ -113,7 +113,7 @@ def rdt_era_env(path="/content/py311"):
            "--index-url https://download.pytorch.org/whl/cu121")
         sh(f'uv pip install -q --python {py} "mani-skill==3.0.0b15" "sapien==3.0.0b1" "transformers==4.41.0" '
            '"diffusers==0.27.2" "timm==1.0.3" "huggingface_hub==0.23.4" "numpy<2" einops sentencepiece pyyaml '
-           "imageio scipy")
+           "imageio imageio-ffmpeg scipy")
         sh(check)
         open(marker, "w").close()
     print("RDT-era env:", sh(check).strip())

@@ -76,6 +76,16 @@ def select_moments(rollout_dir, tasks=None, every=3, max_per_episode=4, only_suc
     return out
 
 
+def balanced_moments(moments, n=None):
+    """Interleave tasks (round robin) so any prefix is task-balanced; keep the first n."""
+    by_task = {}
+    for d, c in moments:
+        by_task.setdefault(os.path.basename(d).split("_ep")[0], []).append((d, c))
+    groups = list(by_task.values())
+    out = [groups[g][i] for i in range(max(map(len, groups), default=0)) for g in range(len(groups)) if i < len(groups[g])]
+    return out if n is None else out[:n]
+
+
 def _cond(pol, meta, c):
     dp = meta["decisions"][c]
     embs = pol.encode([dp["prev"], dp["curr"]])
@@ -184,7 +194,8 @@ def sanity(pol, moments, methods, out, n_evals=8, levels=(7, 14, 28), batch=8, v
         return
     ex = Explainer(pol, batch=batch)
     blocks = pol.rdt.model.blocks
-    backup = {i: {k: v.detach().cpu().clone() for k, v in blocks[i].state_dict().items()} for i in range(len(blocks))}
+    levels = sorted({min(k, len(blocks)) for k in levels})             # RDT-1B has 28 blocks
+    backup ={i: {k: v.detach().cpu().clone() for k, v in blocks[i].state_dict().items()} for i in range(len(blocks))}
     rows = []
     prepared = [(d, c, *_cond(pol, load_episode(d), c)) for d, c in moments]
     base = {(d, c): {m: ex.explain(cond, m, n_evals=n_evals, seed=1)["map"] for m in methods}
