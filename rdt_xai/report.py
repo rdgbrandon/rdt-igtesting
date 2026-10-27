@@ -200,7 +200,8 @@ def closed_loop_report(out, figdir):
     tests = []
     for task, g in df.groupby("task"):
         P = g.pivot_table(index="episode", columns="condition", values="success", aggfunc="first")
-        for a, b in (("random:random", "eig:top"), ("eig:bottom", "eig:top"), ("random:random", "daam:top")):
+        for a, b in (("random:random", "eig:top"), ("eig:bottom", "eig:top"), ("random:random", "daam:top"),
+                     ("eig:bottom_abs", "eig:top_abs"), ("random:random", "eig:bottom_abs")):
             if a in P and b in P:
                 x = P[[a, b]].dropna().astype(bool)
                 n10, n01 = int((x[a] & ~x[b]).sum()), int((~x[a] & x[b]).sum())
@@ -212,7 +213,7 @@ def closed_loop_report(out, figdir):
     for ax, task in zip(axes[0], tasks):
         t = tab[tab.task == task].set_index("condition").reindex(conds)
         ax.bar(range(len(conds)), t.success, yerr=[t.success - t.ci_lo, t.ci_hi - t.success], capsize=3,
-               color=["#999" if c.startswith(("none", "random")) else "#C44E52" if c.endswith("top") else "#55A868"
+               color=["#999" if c.startswith(("none", "random")) else "#C44E52" if ":top" in c else "#55A868"
                       for c in conds])
         ax.set_xticks(range(len(conds)), [c.replace(":", "\n") for c in conds], fontsize=7)
         ax.set_ylim(0, 1)
@@ -327,7 +328,10 @@ def build_report(out, rollout_dir=None):
     if cl is not None:
         cl.to_csv(os.path.join(figdir, "D_closed_loop.csv"), index=False)
         md += ["## D. Closed-loop: success with 10% of patches hidden online (Wilson 95% CI)\n",
-               cl.to_markdown(index=False, floatfmt=".2f"), "\n", "Paired sign tests on discordant episodes:\n",
+               cl.to_markdown(index=False, floatfmt=".2f"), "\n",
+               "`top`/`bottom` rank patches by the signed score (so `eig:bottom` hides the most *negative* patches); "
+               "`top_abs`/`bottom_abs` rank by magnitude (`bottom_abs` = least relevant patches).\n\n",
+               "Paired sign tests on discordant episodes:\n",
                cl_tests.to_markdown(index=False, floatfmt=".3g"), "\n"]
 
     sn = sanity_report(out, figdir)

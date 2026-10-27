@@ -22,7 +22,7 @@ DEFAULTS = dict(
     n_evals=16, fast=False, b_moments=60, b_stability_moments=24, moments_every=3, moments_per_episode=3,
     c_moments=30, d_tasks=["PickCube-v1", "StackCube-v1"], d_episodes=10, d_frac=0.10,
     d_conditions=[["none", "none"], ["eig", "top"], ["eig", "bottom"], ["random", "random"], ["daam", "top"],
-                  ["blurig", "top"]],
+                  ["blurig", "top"], ["eig", "bottom_abs"], ["eig", "top_abs"]],
     e_moments=8, e_methods=["eig", "ig_bg", "blurig", "grad", "gae", "daam"], f_moments=30,
     dtype="fp32", obs_mode="rgb", batch=8,
 )

@@ -5,6 +5,11 @@ filled with RDT's "missing camera" colour), and record task success.
 If an attribution method is faithful, removing its top patches should hurt
 success far more than removing random patches, and removing its bottom
 patches should hurt least. The simulator itself is never modified.
+
+Ranking: 'top' / 'bottom' order patches by the signed score, so for signed
+methods (IG family) 'bottom' removes the most *negative* patches, which matter
+as much as the most positive ones. 'top_abs' / 'bottom_abs' order by |score|:
+'bottom_abs' is the "least relevant patches" control.
 """
 import numpy as np
 import torch
@@ -34,7 +39,7 @@ def apply_mask(img, mask_img, color):
 
 
 class MaskHook:
-    """obs_hook for rollout(): mode in {'none', 'top', 'bottom', 'random'}."""
+    """obs_hook for rollout(): mode in {'none', 'top', 'bottom', 'top_abs', 'bottom_abs', 'random'}."""
 
     def __init__(self, policy, explainer, method="eig", mode="top", frac=0.1, n_evals=8, n_seeds=4, seed=0):
         self.p, self.ex = policy, explainer
@@ -56,7 +61,9 @@ class MaskHook:
             r = self.ex.explain(cond, self.method, n_evals=self.n_evals, n_seeds=self.n_seeds,
                                 seed=self.seed * 1000 + ctx["call"])
             score = r["map"].reshape(-1)
-            order = np.argsort(-score) if self.mode == "top" else np.argsort(score)
+            if self.mode.endswith("_abs"):
+                score = np.abs(score)
+            order = np.argsort(-score) if self.mode.startswith("top") else np.argsort(score)
         sel = np.zeros(n, dtype=bool)
         sel[order[:self.k]] = True
         self.log.append(dict(call=ctx["call"], step=ctx["step"], sel=np.flatnonzero(sel).tolist()))
