@@ -70,7 +70,8 @@ def sync(src, dst):
     return n
 
 
-def setup(out_drive):
+def prepare():
+    """GPU check, installs, Vulkan, RDT source, env vars; no Google Drive needed."""
     gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                          capture_output=True, text=True).stdout.strip()
     print("GPU:", gpu or "NONE", "| python", sys.version.split()[0])
@@ -92,10 +93,91 @@ def setup(out_drive):
             vers[p] = "MISSING"
     print(vers)
     print("code:", sh("git log --oneline -1").strip())
-    os.makedirs(out_drive, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
+
+
+def setup(out_drive):
+    prepare()
+    os.makedirs(out_drive, exist_ok=True)
     print("restored from Drive:", sync(out_drive, OUT), "files")
     return OUT
+
+
+def download_models():
+    """RDT-1B ManiSkill fine-tune, SigLIP-SO400M and the released instruction embeddings (~6 GB)."""
+    import shutil
+    from huggingface_hub import hf_hub_download
+    for sub in ("rdt", "siglip", "lang"):
+        os.makedirs(f"{DATA}/{sub}", exist_ok=True)
+    for f in ["config.json", "preprocessor_config.json", "special_tokens_map.json", "spiece.model",
+              "tokenizer.json", "tokenizer_config.json", "model.safetensors"]:
+        hf_hub_download("google/siglip-so400m-patch14-384", f, local_dir=f"{DATA}/siglip")
+    hf_hub_download("robotics-diffusion-transformer/maniskill-model", "rdt/mp_rank_00_model_states.pt", local_dir=DATA)
+    for t in ["PickCube", "StackCube", "PushCube", "PegInsertionSide", "PlugCharger"]:
+        p = hf_hub_download("robotics-diffusion-transformer/maniskill-model",
+                            f"lang_embeds/text_embed_{t}-v1.pt", local_dir=DATA)
+        if not os.path.exists(f"{DATA}/lang/text_embed_{t}-v1.pt"):
+            shutil.copy(p, f"{DATA}/lang/text_embed_{t}-v1.pt")
+    print("models ready")
+
+
+PAPER = {"PickCube-v1": 0.772, "StackCube-v1": 0.74, "PushCube-v1": 1.0, "PegInsertionSide-v1": 0.132,
+         "PlugCharger-v1": 0.012}
+
+
+def _repro_run(tag, python, task, n, extra):
+    import json
+    path = f"{OUT}/repro_{tag}_{task}_{n}.json"
+    if os.path.exists(path):
+        r = json.load(open(path))
+        print(f"{tag}: {r['success_rate']:.0%} (cached)")
+        return r
+    print(f">> {tag}", flush=True)
+    env = dict(os.environ, RDT_REPO=RDT_REPO, RDT_DATA=DATA)
+    p = subprocess.Popen([python, "tests/repro.py", "--task", task, "-n", str(n), *extra], cwd=REPO, env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    tail = []
+    for line in p.stderr:
+        if line.startswith("  ep"):
+            print(line.rstrip(), flush=True)
+        else:
+            tail = (tail + [line])[-25:]
+    out = p.stdout.read().strip().splitlines()
+    if p.wait() != 0 or not out:
+        print(f"{tag} FAILED (exit {p.returncode}):\n" + "".join(tail))
+        return None
+    r = json.loads(out[-1])
+    json.dump(r, open(path, "w"))
+    print(f"{tag}: {r['success_rate']:.0%}  ({r['minutes']:.1f} min)\n", flush=True)
+    return r
+
+
+def repro_check(task="PickCube-v1", n=10):
+    """Does RDT reproduce its paper success rate, and with which simulator? Three runs:
+    official code on the current stack, official code on the Nov-2024 stack, this repo on the Nov-2024 stack."""
+    from scipy.stats import fisher_exact
+    prepare()
+    download_models()
+    res = {"official / current sim (ManiSkill 3.0.1)": _repro_run("official_current", sys.executable, task, n,
+                                                                   ["--impl", "official", "--dtype", "bf16"])}
+    py = rdt_era_env()
+    res["official / 2024 sim (ManiSkill 3.0.0b15)"] = _repro_run("official_rdt_era", py, task, n,
+                                                                 ["--impl", "official", "--dtype", "bf16"])
+    res["this repo / 2024 sim (ManiSkill 3.0.0b15)"] = _repro_run("ours_rdt_era", py, task, n,
+                                                                  ["--impl", "ours", "--dtype", "fp32", "--obs", "rgb"])
+    paper = PAPER.get(task)
+    print(f"\n===== {task}: RDT paper {paper:.1%} =====")
+    for k, r in res.items():
+        if r is None:
+            print(f"{k:45s} FAILED")
+            continue
+        k_succ = round(r["success_rate"] * r["n"])
+        # one-sided exact test against the paper rate as if it came from 250 trials
+        _, pv = fisher_exact([[k_succ, r["n"] - k_succ], [round(paper * 250), 250 - round(paper * 250)]],
+                             alternative="less")
+        print(f"{k:45s} {k_succ:2d}/{r['n']} = {r['success_rate']:4.0%}   "
+              f"p(below paper) = {pv:.3f}   sapien {r['versions']['sapien']}")
+    return res
 
 
 def rdt_era_env(path="/content/py311"):
