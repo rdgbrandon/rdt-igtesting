@@ -51,8 +51,8 @@ C 15, D 6 episodes/condition at 10% grey patches, E 8, F 15.
   IG (bg) 0.07, BlurIG 0.08 vs DAAM 0.97, GAE 0.90, Gradient 0.88.
 * **Faithfulness (B), not usable as is:** deletion AUC Expected IG 1.68 [0.97, 2.85], best mean but paired Wilcoxon
   significant only vs Random, ISS, Occlusion. Every method's deletion curve peaks at ~2.0-2.2 x the whole-view
-  deviation after removing 5% of patches: grey squares are out of distribution, so the AUC mostly scores the
-  artifact.
+  deviation after removing 5% of patches. Hypothesis: grey squares are out of distribution, so the AUC mostly
+  scores the artifact. *(Refuted in iteration 3: the peak is the same with inpainting.)*
 * **Closed loop (D), not usable as is:** 10% grey patches - top patches of every method 0/6; random already breaks
   StackCube (6/6 -> 2/6); no sign test significant.
 * **Modality (F):** proprioception carries 53-71% of the Shapley share; the time plot had 2-3 points per task.
@@ -67,6 +67,44 @@ C 15, D 6 episodes/condition at 10% grey patches, E 8, F 15.
 * F: modality Shapley at every decision of 8 successful episodes per task (`F_modality/`).
 * Report: Wilson fix; one-cell notebook `rdt_xai_run_all.ipynb`; parallel Drive sync.
 
-## Iteration 3 — inpainted removal, extended B/C/D/F
+## Iteration 3 — inpainted removal, extended B/C/D/F (Oct 27–29, 2026)
+
+**Ran:** `rdt_xai_run_all.ipynb` resuming `pilot2` (same rollouts, maps and E), A100, `ENV="rdt_era"`, two sessions
+(the first disconnected in stage D; the rerun skipped finished work). B 60 moments (fast curves) re-scored with
+inpainting, full curves; C 30; D 10 episodes per condition, 5% of patches, inpainted; F 30 moments + modality at
+every decision of 8 successful episodes per task. Roughly 2.5 h of GPU time over both sessions.
+
+**Showed:**
+* **Inpainting did not remove the deletion-curve overshoot:** mean peak D/D_full 1.94-2.18 for every method
+  except ISS (1.72) and Grad x Input (1.40) (grey fill: 1.89-2.04; Random 1.21 vs 1.11). So it is not a grey-square artifact.
+  Likely reading: with no camera RDT falls back on joint state (64-70% Shapley share) and its plan stays close,
+  while a view with the object hidden is a different scene. D_full is shared within a moment, so per-moment
+  comparisons are unaffected, but means are not: ISS scored 16.2 on one moment with a tiny D_full.
+* **Faithfulness (B) does not favour Expected IG.** Inpainted deletion (mean): BlurIG 1.19, Occlusion 1.18,
+  IG (bg) 1.15, Expected IG 1.14, Gradient 1.13, ... Random 0.72; Expected IG vs every non-trivial baseline n.s.
+  except Grad x Input (p=4e-4) and ISS (p=7e-6). Insertion: DAAM 0.57, Gradient 0.56, GAE 0.53 beat Expected IG
+  0.38 (Wilcoxon p<2e-6). Deletion ranking depends on the fill: Expected IG 1st with grey, 4th inpainted.
+* **Closed loop (D) is causal for Expected IG but does not separate methods.** Success with 5% hidden,
+  PickCube / StackCube: none 7/10, 9/10; random 4/10, 6/10; eig top_abs 0/10, 0/10; eig bottom_abs 6/10, 10/10
+  (bottom_abs vs top_abs sign test p=0.031, 0.002; random vs top_abs StackCube p=0.031). DAAM top 0/10, 0/10 and
+  BlurIG top 2/10, 0/10: floor effect at 5%.
+* **Denoising time (C), n=30, holds:** Expected-IG share by step 0.08 / 0.05 / 0.07 / 0.21 / 0.60; plan change with
+  vision removed at one step 0.04 / 0.04 / 0.05 / 0.09 / 0.57; plan recovered with vision at one step only
+  0.09 / 0.07 / 0.14 / 0.39 / 0.81.
+* **Modality (F):** over every decision of whole episodes, vision 0.33 / 0.30 / 0.24, language 0.03 / 0.05 / 0.06,
+  joint state 0.64 / 0.65 / 0.70 (PickCube / PushCube / StackCube). Word IG vs word removal rank agreement
+  0.44-0.57.
+* E unchanged from iteration 2 (Expected IG, IG, BlurIG ~0; DAAM 0.97, GAE 0.90, Gradient 0.88 at 7 blocks).
+
+**Changed:** B is summarized with medians, mean per-moment ranks and median paired differences; moments with
+D_full below 0.25 x the median are flagged and means are shown with and without them; the report no longer calls
+D/D_full > 1 an artifact.
+
+**Open:** separate methods in D (1-2% of patches, more episodes); randomize SigLIP too in E (only RDT blocks are
+re-initialized, so maps that track SigLIP's input sensitivity can survive); paper framing — "faithful" in the
+causal sense (D) and the model-dependence sense (E), while deletion / insertion rankings are fill-dependent and
+disagree with E.
+
+## Iteration 4
 
 *(pending)*

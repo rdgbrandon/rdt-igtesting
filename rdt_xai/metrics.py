@@ -12,9 +12,14 @@ from the seeds used to compute the explanation, and normalized by the
 deviation when the whole view is removed, D_full.
 
 Removed patches are inpainted from the remaining pixels by default (fill.py);
-fill="gray" pastes the "missing camera" colour instead (the pilot's metric). Grey
-squares are out of distribution: in the pilot, removing 5% of patches that way
-moved the plan ~2x more than removing the whole view, for every method alike.
+fill="gray" pastes the "missing camera" colour instead (the pilot 2 metric).
+D(f)/D_full is not bounded by 1: the deletion curve peaks at ~2 on average (pilot 3,
+every method, under either fill), i.e. removing a few top patches moves the plan more
+than removing the whole view (without a camera RDT falls
+back on joint state; with the object hidden it plans for a different scene). D_full is
+shared by all methods within a moment, so per-moment comparisons do not depend on it,
+but means over moments can be dominated by moments with a tiny D_full (report.py
+summarizes with medians and per-moment ranks).
 
   deletion (MoRF)   remove most-relevant patches first; AUC of D(f)/D_full      higher = better
   deletion (LeRF)   remove least-relevant first;                                lower  = better

@@ -18,16 +18,18 @@ import matplotlib.pyplot as plt  # noqa: E402
 LABEL = dict(random="Random", daam="DAAM (attention)", gae="GAE (grad x attn)", grad="Gradient",
              gxi="Grad x Input", occlusion="Occlusion", iss="ISS (ICML'26)", ig_zero="IG (zero)",
              ig_bg="IG (bg)", blurig="BlurIG (orig. repo)", eig="Expected IG (ours)")
+# the 8 executed ManiSkill joints in policy order (kept here so the report needs neither torch nor RDT)
+JOINT_NAMES = ["base rot", "shoulder", "upper arm", "elbow", "forearm rot", "wrist pitch", "wrist rot", "gripper"]
 
 
-def _ci(x, n_boot=2000, seed=0):
+def _ci(x, n_boot=2000, seed=0, stat=np.mean):
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if len(x) == 0:
         return np.nan, np.nan, np.nan
     rng = np.random.default_rng(seed)
-    bs = rng.choice(x, (n_boot, len(x))).mean(1)
-    return x.mean(), *np.percentile(bs, [2.5, 97.5])
+    bs = stat(rng.choice(x, (n_boot, len(x))), axis=1)
+    return stat(x), *np.percentile(bs, [2.5, 97.5])
 
 
 def _fmt(m, lo, hi):
@@ -61,27 +63,52 @@ def load_benchmark(bdir):
     return pd.DataFrame(rows)
 
 
+FAITH = ("deletion_morf", "insertion")          # higher = better; scale shared by all methods within a moment
+LOW_SIGNAL = 0.25                               # D_full below this fraction of the median D_full
+
+
+def mean_rank(df, c):
+    """Mean over moments of each method's rank on metric c within the moment (1 = best). Within a moment
+    every method shares D_full, so ranks do not depend on the normalization."""
+    return df.groupby("moment")[c].rank(ascending=False).groupby(df["method"]).mean()
+
+
+def low_signal(df):
+    """Moments where removing the whole view barely moves the plan: D/D_full divides by a small number
+    there, so a method's mean can be dominated by one of them (pilot 3: ISS 16.2 on one moment)."""
+    d = df.groupby("moment").d_full.first() if "d_full" in df else pd.Series(dtype=float)
+    return d[d < LOW_SIGNAL * d.median()]
+
+
 def benchmark_tables(df, ref="eig"):
+    """Per method: median [95% bootstrap CI] and mean per-moment rank for deletion / insertion (robust
+    to low-signal moments), mean [CI] for the rest; paired tests of `ref` against every other method."""
     metrics = [c for c in ("deletion_morf", "insertion", "deletion_lerf", "morf_minus_lerf", "seed_spearman",
                            "seed_top10_iou", "completeness_rel_err", "prev_share", "seconds") if c in df]
+    ranks = {c: mean_rank(df, c) for c in FAITH}
+    low = set(low_signal(df).index)
     rows = []
     for m, g in df.groupby("method"):
         row = {"method": LABEL.get(m, m), "key": m, "n": len(g)}
         for c in metrics:
-            row[c] = _fmt(*_ci(g[c]))
+            row[c] = _fmt(*_ci(g[c], stat=np.median if c in FAITH else np.mean))
             row[c + "_mean"] = g[c].mean()
+        for c in FAITH:
+            row[c + "_rank"] = ranks[c][m]
+            row[c + "_median"] = g[c].median()
+            row[c + "_mean_excl_low"] = g[~g.moment.isin(low)][c].mean()
         rows.append(row)
-    t = pd.DataFrame(rows).sort_values("deletion_morf_mean", ascending=False)
+    t = pd.DataFrame(rows).sort_values("deletion_morf_rank")
     # paired tests: reference method vs every other, per moment
     tests = []
-    piv = {c: df.pivot_table(index="moment", columns="method", values=c) for c in ("deletion_morf", "insertion")}
+    piv = {c: df.pivot_table(index="moment", columns="method", values=c) for c in FAITH}
     for m in df["method"].unique():
         if m == ref or ref not in df["method"].unique():
             continue
         row = {"vs": LABEL.get(m, m)}
         for c, P in piv.items():
             d = (P[ref] - P[m]).dropna()
-            row[c + "_diff"] = d.mean()
+            row[c + "_median_diff"] = d.median()
             row[c + "_winrate"] = (d > 0).mean()
             row[c + "_p"] = wilcoxon(d).pvalue if len(d) > 5 and np.any(d != 0) else np.nan
         tests.append(row)
@@ -100,25 +127,22 @@ def load_curves(bdir):
 
 
 def fill_comparison(out):
-    """Pilot grey fill vs inpainting on the same maps and moments. `peak_morf` is the mean over moments
-    of max D(f)/D_full along the deletion curve: above 1, removing part of the view moved the plan more
-    than removing all of it (an out-of-distribution input, not evidence about the method)."""
+    """Pilot grey fill vs inpainting on the same maps and moments: median deletion, mean per-moment
+    deletion rank, and `peak_morf`, the mean over moments of max D(f)/D_full along the deletion curve."""
     rows = {}
     for fill, sub in (("gray", "B"), ("inpaint", "B_inpaint")):
         df = load_benchmark(os.path.join(out, sub))
         if not len(df):
             return None
+        rk = mean_rank(df, "deletion_morf")
         for m, g in df.groupby("method"):
             rows.setdefault(m, {"method": LABEL.get(m, m)})
-            rows[m][f"deletion_{fill}"] = g.deletion_morf.mean()
-            rows[m][f"insertion_{fill}"] = g.insertion.mean()
+            rows[m][f"deletion_median_{fill}"] = g.deletion_morf.median()
+            rows[m][f"deletion_rank_{fill}"] = rk[m]
         for (m, cv), ys in load_curves(os.path.join(out, sub)).items():
             if cv == "curve_morf":
                 rows[m][f"peak_morf_{fill}"] = np.mean([max(y) for y in ys])
-    t = pd.DataFrame(rows.values()).sort_values("deletion_inpaint", ascending=False)
-    for fill in ("gray", "inpaint"):
-        t[f"rank_{fill}"] = t[f"deletion_{fill}"].rank(ascending=False).astype(int)
-    return t
+    return pd.DataFrame(rows.values()).sort_values("deletion_rank_inpaint")
 
 
 def plot_curves(bdir, figdir, name="fig_faithfulness_curves", note=""):
@@ -290,7 +314,6 @@ def sanity_report(out, figdir):
 
 
 def language_report(out, figdir):
-    from .policy import JOINT_NAMES
     recs = [json.load(open(f)) for f in glob.glob(os.path.join(out, "F", "*.json"))]
     if not recs:
         return None, None
@@ -371,27 +394,43 @@ def build_report(out, rollout_dir=None):
     df = load_benchmark(bdir)
     if len(df):
         t, tests = benchmark_tables(df)
-        cols = ["method", "n"] + [c for c in ("deletion_morf", "insertion", "morf_minus_lerf", "seed_spearman",
-                                              "completeness_rel_err", "prev_share", "seconds") if c in t]
-        t[cols].to_csv(os.path.join(figdir, "B_faithfulness.csv"), index=False)
+        cols = ["method", "n", "deletion_morf", "deletion_morf_rank", "insertion", "insertion_rank"] + [
+            c for c in ("morf_minus_lerf", "seed_spearman", "completeness_rel_err", "prev_share", "seconds") if c in t]
+        t.drop(columns="key").to_csv(os.path.join(figdir, "B_faithfulness.csv"), index=False)
         tests.to_csv(os.path.join(figdir, "B_paired_tests.csv"), index=False)
-        md += ["## B. Faithfulness at matched compute (mean [95% bootstrap CI] over moments)\n",
-               f"Removed patches are {fill}.\n\n",
-               t[cols].to_markdown(index=False), "\n",
-               "Paired Wilcoxon tests, Expected IG minus each method (positive = ours better):\n",
-               tests.to_markdown(index=False, floatfmt=".3g"), "\n"]
-        per_task = df.pivot_table(index="method", columns="task", values="deletion_morf").rename(index=LABEL)
-        md += ["Deletion AUC by task:\n", per_task.to_markdown(floatfmt=".3f"), "\n"]
+        low = low_signal(df)
+        low.rename("d_full").to_csv(os.path.join(figdir, "B_low_signal_moments.csv"))
+        md += ["## B. Faithfulness at matched compute\n",
+               f"Removed patches are {fill}. Scores are plan deviation divided by the deviation with the whole "
+               "view removed (D_full). D_full is shared by every method within a moment, so per-moment "
+               "comparisons (ranks, win rates, Wilcoxon) do not depend on it; scores above 1 are common, see "
+               "the fill comparison below. `deletion_morf` / `insertion`: median [95% bootstrap CI] over "
+               "moments; `*_rank`: mean per-moment rank (1 = best of 11); other columns: mean [95% CI].\n\n",
+               t[cols].to_markdown(index=False, floatfmt=".2f"), "\n",
+               "Paired Wilcoxon tests, Expected IG minus each method (positive = ours better; median "
+               "per-moment difference):\n",
+               tests.to_markdown(index=False, floatfmt=".3g"), "\n",
+               f"Low-signal moments (D_full below {LOW_SIGNAL:g} x the median, where removing the whole view "
+               f"barely moves the plan and ratios are unstable): {len(low)} of {df.moment.nunique()}"
+               + (" - " + ", ".join(low.index) if len(low) else "") + ". Medians and ranks are insensitive to "
+               "them; means with and without them:\n",
+               t[["method", "deletion_morf_mean", "deletion_morf_mean_excl_low", "insertion_mean",
+                  "insertion_mean_excl_low"]].to_markdown(index=False, floatfmt=".3f"), "\n"]
+        per_task = df.pivot_table(index="method", columns="task", values="deletion_morf",
+                                  aggfunc="median").rename(index=LABEL)
+        md += ["Median deletion score by task:\n", per_task.to_markdown(floatfmt=".3f"), "\n"]
         plot_curves(bdir, figdir, note=f"  [{fill.split()[0]} fill]")
         plot_qualitative(os.path.join(out, "B"), rollout_dir, figdir)
         fc = fill_comparison(out) if bdir.endswith("_inpaint") else None
         if fc is not None:
             plot_curves(os.path.join(out, "B"), figdir, name="fig_faithfulness_curves_gray", note="  [grey fill]")
             fc.to_csv(os.path.join(figdir, "B_fill_comparison.csv"), index=False)
-            md += ["Same maps, grey fill (pilot metric) vs inpainting. `peak_morf` = mean max of D(f)/D_full along "
-                   "the deletion curve; above 1, removing part of the view moved the plan more than removing all "
-                   "of it, i.e. the score reflects an out-of-distribution input rather than the method:\n",
-                   fc.to_markdown(index=False, floatfmt=".3f"), "\n"]
+            md += ["Same maps, grey fill (pilot 2 metric) vs inpainting. `peak_morf` = mean over moments of the "
+                   "maximum of D(f)/D_full along the deletion curve. It is ~2 under both fills, so it is not a "
+                   "grey-square artifact: hiding a few top patches moves the plan more than hiding the camera "
+                   "entirely (without a camera RDT falls back on joint state; with the object hidden it plans "
+                   "for a different scene). The method ranking does change with the fill:\n",
+                   fc.to_markdown(index=False, floatfmt=".2f"), "\n"]
 
     dn = denoise_report(out, figdir)
     if dn is not None:

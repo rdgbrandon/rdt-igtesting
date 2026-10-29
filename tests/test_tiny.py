@@ -183,7 +183,8 @@ txt = build_report(tmp)
 figs = sorted(os.path.basename(f) for f in glob.glob(os.path.join(tmp, "report", "*.png")))
 check("report", "Faithfulness" in txt and "Modality" in txt and "fig_word_joint.png" in figs
       and "fig_closed_loop.png" in figs and "fig_faithfulness_curves_gray.png" in figs and "peak_morf" in txt
-      and "inpaint fill" in txt and "every decision" in txt, " ".join(figs))
+      and "inpaint fill" in txt and "every decision" in txt and "Low-signal moments" in txt
+      and "deletion_morf_rank" in txt, " ".join(figs))
 
 if args.rollout:
     print("rollout")

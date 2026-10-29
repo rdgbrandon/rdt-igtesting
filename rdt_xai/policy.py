@@ -75,7 +75,6 @@ TASK2LANG = {
     "PlugCharger-v1": "Pick up one of the misplaced shapes on the board/kit and insert it into the correct empty slot.",
     "PushCube-v1": "Push and move a cube to a goal region in front of it.",
 }
-JOINT_NAMES = ["base rot", "shoulder", "upper arm", "elbow", "forearm rot", "wrist pitch", "wrist rot", "gripper"]
 CTRL_FREQ = 25
 N_SLOTS = 6
 EXT_PREV, EXT_CURR = 0, 3          # slot indices of the external camera at t-1 and t

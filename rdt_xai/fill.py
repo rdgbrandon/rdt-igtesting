@@ -1,14 +1,12 @@
 """Method-neutral patch removal, shared by the faithfulness metrics and the closed-loop test.
 
-Filling removed patches with a flat colour (RDT's "missing camera" grey) puts grey
-squares into an otherwise normal frame - an input RDT never saw in training. In the
-pilot, removing 5% of patches that way changed the plan about twice as much as
-removing the whole view, for every method alike, so deletion AUC mostly measured the
-artifact, and hiding 10% random patches online already broke StackCube (6/6 -> 2/6).
+`inpaint` (default) fills removed pixels by push-pull interpolation (Gortler et al.
+1996) from the pixels that remain: smooth, uses nothing from the removed pixels (unlike
+blurring, which leaks them and is BlurIG's baseline), and shares no baseline with any
+method (grey is IG (bg)'s baseline). `gray` pastes RDT's "missing camera" colour, the
+pilot 2 protocol. The fill changes the deletion ranking of methods but not the curve
+overshoot (D/D_full peaks at ~2 under both; see metrics.py).
 
-`inpaint` fills removed pixels by push-pull interpolation (Gortler et al. 1996) from
-the pixels that remain: smooth, uses nothing from the removed pixels (unlike blurring,
-which leaks them and is BlurIG's baseline), and shares no baseline with any method.
 With every pixel removed there is nothing to interpolate from and the result is 0, so
 callers work relative to the grey image and full removal stays RDT's "missing camera".
 """
