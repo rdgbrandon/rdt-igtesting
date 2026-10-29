@@ -114,3 +114,27 @@ removed from both frames (inpainted) vs an equally large set of background patch
 claimed share and measured effect, top-1 agreement, task-object enrichment, and the split before / after the grasp.
 
 *(results pending)*
+
+## Iteration 5 — second policy: ManiSkill's Diffusion Policy baseline (Oct 29, 2026)
+
+**Setup:** `colab.train_dp` runs ManiSkill 3.0.1's `train_rgbd.py` (RGB, 128x128 base camera, 2 frames, U-Net,
+100 DDPM steps, pd_ee_delta_pos, 100 motion-planning demos, 30k iterations, settings of its `baselines.sh`) on the
+Colab stack: gymnasium 1.4.0, diffusers 0.42, torch 2.11, numpy 2.1, Python 3.13.
+
+**Three incompatibilities of the baseline with that stack** (patched by `DP_PATCHES`, nothing in ManiSkill itself):
+* eval env workers started with `forkserver` hit "Cannot re-initialize CUDA in forked subprocess": use `spawn`;
+* gymnasium >= 1.0 resets a finished vector env one step late and drops `final_info`: same-step autoreset, and read
+  the ending step's infos as a dict of arrays;
+* **silent:** gymnasium >= 1.0's `batch_space` sorts Dict keys, so the training data (reordered to the env's batched
+  observation space) packs the state alphabetically (extra: goal_pos, is_grasped, tcp_pose), while the eval wrapper
+  packs the env's own order (is_grasped, tcp_pose, goal_pos). The evaluated policy got the goal where it learned the
+  gripper pose. PickCube at 25k iterations: 0/100 in the baseline's eval, while it fit the demo actions to a mean
+  error of 0.003 (0.302 for the mean action), open-loop demo replay succeeded, and the live and demo images matched
+  (mean diff 0.5/255). Fix: flatten live obs in the batched space's order (`SpaceOrderFlatten`). `dp_diagnose`
+  runs these checks.
+
+**Result:** PickCube, same 25k checkpoint, fixed eval, 100 fresh episodes: success_once 0.91, success_at_end 0.62.
+PushCube: *(training)*.
+
+**Caveat for any DP number:** a policy trained before the fix is fine; only its in-training eval scores (and so
+`best_eval_*.pt`) are wrong. The attribution adapter must build the state in the same sorted order.
