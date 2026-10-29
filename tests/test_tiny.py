@@ -178,13 +178,64 @@ for cond, succ in ((("none", "none"), True), (("random", "random"), False), (("e
         json.dump(dict(task=task, episode=ep, method=cond[0], mode=cond[1], frac=0.05, fill="inpaint",
                        success=succ, steps=100, wall=1.0),
                   open(os.path.join(tmp, "D_inpaint", f"{task}_{cond[0]}-{cond[1]}-5_ep{ep:03d}.json"), "w"))
+# G: object grounding. Replay bookkeeping against a fake deterministic env, then the stage on cached segmentation
+from rdt_xai.grounding import replay_segmentation  # noqa: E402
+
+
+class _FakeEnv:
+    """State = number of steps taken; frame and segmentation are functions of it."""
+    def __init__(self):
+        self.t, self.unwrapped = 0, self
+        self.segmentation_id_map = {1: types.SimpleNamespace(name="cubeA")}
+
+    def reset(self, seed=None):
+        self.t = 0
+
+    def step(self, a):
+        self.t += 1
+
+    def evaluate(self):
+        return dict(is_cubeA_grasped=np.array([self.t > 20]))
+
+
+import types  # noqa: E402
+fake_frame = lambda env: Image.fromarray(np.full((8, 8, 3), env.t % 256, dtype=np.uint8))
+fake_meta = dict(seed=0, steps=40, decisions=[
+    dict(step=0, prev=None, curr=fake_frame(types.SimpleNamespace(t=0)), actions=[[0.0]] * 16),
+    dict(step=16, prev=fake_frame(types.SimpleNamespace(t=15)), curr=fake_frame(types.SimpleNamespace(t=16)),
+         actions=[[0.0]] * 16),
+    dict(step=32, prev=fake_frame(types.SimpleNamespace(t=31)), curr=fake_frame(types.SimpleNamespace(t=32)),
+         actions=[[0.0]] * 16)])
+fe = _FakeEnv()
+segs, names, state, diffs = replay_segmentation(fake_meta, tmp, fe, fake_frame,
+                                                seg_fn=lambda env: np.full((8, 8), env.t, dtype=np.int32))
+check("replay in sync", fe.t == 40 and max(diffs) == 0 and len(diffs) == 5 and int(segs["call001_prev"][0, 0]) == 15
+      and state[2]["is_cubeA_grasped"] == 1.0 and state[0]["is_cubeA_grasped"] == 0.0 and names == {1: "cubeA"},
+      f"steps={fe.t} diffs={diffs}")
+
+os.makedirs(os.path.join(tmp, "G", "seg"))
+seg = np.zeros((512, 512), dtype=np.int16)
+seg[300:380, 150:230], seg[300:380, 300:380], seg[100:180, 200:260], seg[180:300, 220:250] = 1, 2, 3, 4
+np.savez_compressed(os.path.join(tmp, "G", "seg", f"{task}_ep000.npz"),
+                    **{f"call{k:03d}_{n}": seg for k in range(3) for n in ("prev", "curr")})
+json.dump(dict(names={"0": "ground", "1": "cubeA", "2": "cubeB", "3": "panda_hand", "4": "panda_link4"},
+               state={"0": {"is_cubeA_grasped": 0.0}, "2": {"is_cubeA_grasped": 1.0}}, rgb_diff_max=0.0,
+               rgb_diff_mean=0.0), open(os.path.join(tmp, "G", "seg", f"{task}_ep000.json"), "w"))
+X.grounding(pol, os.path.join(tmp, "B"), os.path.join(tmp, "A"), os.path.join(tmp, "G"), verbose=False)
+gr = [json.load(open(f)) for f in glob.glob(os.path.join(tmp, "G", "*.json"))]
+ok = len(gr) == 2 and gr[0]["groups"] == ["red cube", "green cube", "gripper", "arm", "background"]
+ok = ok and all(np.isfinite(g["effect"][:4]).all() and np.isfinite(g["control"][:4]).all() for g in gr)
+ok = ok and abs(sum(gr[0]["area_share"]) - 1) < 1e-6 and abs(sum(gr[0]["claim"]["eig"]) - 1) < 1e-6
+check("grounding stage", ok, " ".join(f"{g}:{e:.2f}" for g, e in zip(gr[0]["groups"], gr[0]["effect"])))
+
 from rdt_xai.report import build_report  # noqa: E402
 txt = build_report(tmp)
 figs = sorted(os.path.basename(f) for f in glob.glob(os.path.join(tmp, "report", "*.png")))
 check("report", "Faithfulness" in txt and "Modality" in txt and "fig_word_joint.png" in figs
       and "fig_closed_loop.png" in figs and "fig_faithfulness_curves_gray.png" in figs and "peak_morf" in txt
       and "inpaint fill" in txt and "every decision" in txt and "Low-signal moments" in txt
-      and "deletion_morf_rank" in txt, " ".join(figs))
+      and "deletion_morf_rank" in txt and "Object grounding" in txt and "Before vs after the grasp" in txt
+      and "fig_grounding.png" in figs, " ".join(figs))
 
 if args.rollout:
     print("rollout")

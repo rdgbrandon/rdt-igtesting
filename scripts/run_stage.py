@@ -3,7 +3,7 @@
 executes this script (the Colab kernel, the RDT-era venv, or an Expanse node).
 
     python scripts/run_stage.py --config cfg.json --stage A
-    stages: verify, A, B, C, D, E, F, video
+    stages: verify, A, B, C, D, E, F, G, video
 
 Config keys (all optional except out): see DEFAULTS. Every stage is resumable.
 """
@@ -30,7 +30,7 @@ DEFAULTS = dict(
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--config", required=True)
-ap.add_argument("--stage", required=True, choices=["verify", "A", "B", "C", "D", "E", "F", "video"])
+ap.add_argument("--stage", required=True, choices=["verify", "A", "B", "C", "D", "E", "F", "G", "video"])
 ap.add_argument("--episode", default="", help="video: episode dir name under <out>/A (default: first successful)")
 args = ap.parse_args()
 cfg = dict(DEFAULTS, **json.load(open(args.config)))
@@ -154,6 +154,8 @@ elif args.stage == "F":
     X.language(pol, moments()[:cfg["f_moments"]], os.path.join(out, "F"), n_evals=cfg["n_evals"], batch=cfg["batch"])
     X.modality_timeline(pol, os.path.join(out, "A"), cfg["tasks"], cfg["f_timeline_episodes"],
                         os.path.join(out, "F_modality"))
+elif args.stage == "G":
+    X.grounding(pol, os.path.join(out, "B"), os.path.join(out, "A"), os.path.join(out, "G"), fill=cfg["b_fill"])
 elif args.stage == "video":
     import imageio
     import matplotlib

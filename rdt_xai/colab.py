@@ -184,7 +184,8 @@ def run_stage(py, cfg, stage, out_drive, *extra):
 
 
 FIGURES = ("fig_faithfulness_curves", "fig_faithfulness_curves_gray", "fig_qualitative", "fig_denoising_steps",
-           "fig_denoising_step_maps", "fig_closed_loop", "fig_sanity", "fig_word_joint", "fig_modality")
+           "fig_denoising_step_maps", "fig_closed_loop", "fig_sanity", "fig_word_joint", "fig_modality",
+           "fig_grounding")
 
 
 def show_report(out, out_drive=None):

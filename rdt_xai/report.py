@@ -375,6 +375,80 @@ def _shares(df):
     return df
 
 
+def grounding_report(out, figdir, show=("eig", "daam", "grad", "blurig", "random")):
+    """Stage G: what each method claims the policy looks at (per scene object) vs what removing
+    that object does to the plan."""
+    recs = [json.load(open(f)) for f in glob.glob(os.path.join(out, "G", "*.json"))]
+    recs = [r for r in recs if "effect" in r]
+    if not recs:
+        return None
+    rows = []
+    for r in recs:
+        gs, area = r["groups"], np.array(r["area_share"])
+        task_objs = [i for i, g in enumerate(gs) if g not in ("gripper", "arm", "background")]
+        for m in r["claim"]:
+            c = np.array(r["claim"][m])
+            rows.append(dict(moment=r["moment"], task=r["task"], method=m, spearman=r["spearman"][m],
+                             top1=r["top1"][m], on_object=1 - c[-1], task_objects=c[task_objs].sum(),
+                             task_area=area[task_objs].sum()))
+    df = pd.DataFrame(rows)
+    methods = []
+    for m, g in df.groupby("method"):
+        methods.append(dict(method=LABEL.get(m, m), key=m, n=len(g), claim_vs_effect_spearman=_fmt(*_ci(g.spearman)),
+                            spearman_mean=g.spearman.mean(), top1_agreement=g.top1.mean(),
+                            task_object_share=g.task_objects.mean(),
+                            task_object_enrichment=(g.task_objects / g.task_area.clip(1e-6)).median()))
+    mt = pd.DataFrame(methods).sort_values("spearman_mean", ascending=False)
+
+    per_obj, phase_rows = [], []
+    for task in sorted({r["task"] for r in recs}):
+        rs = [r for r in recs if r["task"] == task]
+        gs = rs[0]["groups"]
+        E = np.array([r["effect"] for r in rs], dtype=float)
+        C = np.array([r["control"] for r in rs], dtype=float)
+        A = np.array([r["area_share"] for r in rs])
+        K = np.array([r["claim"]["eig"] for r in rs]) if "eig" in rs[0]["claim"] else None
+        for i, g in enumerate(gs[:-1]):
+            per_obj.append(dict(task=task, object=g, area_share=A[:, i].mean(), effect_median=np.nanmedian(E[:, i]),
+                                control_median=np.nanmedian(C[:, i]),
+                                effect_over_control=np.nanmedian(E[:, i] / np.where(C[:, i] > 0, C[:, i], np.nan)),
+                                eig_claim=K[:, i].mean() if K is not None else np.nan))
+        grasp = np.array([any(v > 0.5 for k, v in r.get("state", {}).items() if "grasped" in k) for r in rs])
+        if grasp.any() and (~grasp).any():
+            for ph, sel in (("not grasped", ~grasp), ("grasped", grasp)):
+                for i, g in enumerate(gs[:-3]):
+                    phase_rows.append(dict(task=task, phase=ph, n=int(sel.sum()), object=g,
+                                           eig_claim=K[sel, i].mean() if K is not None else np.nan,
+                                           effect_median=np.nanmedian(E[sel, i])))
+    po, ph = pd.DataFrame(per_obj), pd.DataFrame(phase_rows)
+
+    tasks = sorted(po.task.unique())
+    fig, axes = plt.subplots(1, len(tasks), figsize=(4.6 * len(tasks), 3.4), squeeze=False)
+    for ax, task in zip(axes[0], tasks):
+        rs = [r for r in recs if r["task"] == task]
+        gs = rs[0]["groups"][:-1]
+        E = np.nanmean(np.array([r["effect"] for r in rs], dtype=float)[:, :-1], 0)
+        bars = {"plan change when removed": E / (np.nansum(E) + 1e-12)}
+        for m in show:
+            if m in rs[0]["claim"]:
+                K = np.mean([r["claim"][m] for r in rs], 0)[:-1]
+                bars[LABEL.get(m, m)] = K / (K.sum() + 1e-12)
+        w = 0.8 / len(bars)
+        for j, (lab, v) in enumerate(bars.items()):
+            ax.bar(np.arange(len(gs)) + (j - (len(bars) - 1) / 2) * w, v, w, label=lab,
+                   color="k" if j == 0 else None)
+        ax.set_xticks(range(len(gs)), gs, fontsize=8)
+        ax.set_title(f"{task}: share per object (excl. background), n={len(rs)}", fontsize=8)
+        ax.grid(axis="y", alpha=.3)
+    axes[0][0].legend(fontsize=6)
+    fig.tight_layout()
+    fig.savefig(os.path.join(figdir, "fig_grounding.png"), dpi=150)
+    plt.close(fig)
+    seg = [json.load(open(f)) for f in glob.glob(os.path.join(out, "G", "seg", "*.json"))]
+    replay = max((x["rgb_diff_max"] for x in seg), default=float("nan"))
+    return mt, po, ph, replay
+
+
 def build_report(out, rollout_dir=None):
     rollout_dir = rollout_dir or os.path.join(out, "A")
     figdir = os.path.join(out, "report")
@@ -465,6 +539,27 @@ def build_report(out, rollout_dir=None):
             tl.to_csv(os.path.join(figdir, "F_modality_timeline.csv"))
             md += ["Modality share over every decision of whole successful episodes:\n",
                    tl.to_markdown(floatfmt=".3f"), "\n"]
+
+    gr = grounding_report(out, figdir)
+    if gr is not None:
+        mt, po, ph, replay = gr
+        mt.drop(columns="key").to_csv(os.path.join(figdir, "G_grounding_methods.csv"), index=False)
+        po.to_csv(os.path.join(figdir, "G_grounding_objects.csv"), index=False)
+        md += ["## G. Object grounding: what each method claims vs what removing the object does\n",
+               "Each scene object (from the simulator's segmentation of the frames the policy saw; replayed "
+               f"episodes match the saved frames to a mean |RGB diff| of at most {replay:.2f}) is removed "
+               "from both frames and the plan change is measured (/ D_full). `claim_vs_effect_spearman`: per "
+               "moment, rank agreement between a method's attribution share and the measured effect across "
+               "objects (gripper, arm, task objects); `top1_agreement`: the most-claimed object is the "
+               "most-effective one; `task_object_enrichment`: attribution share on task objects / their area "
+               "share (median).\n\n",
+               mt.drop(columns=["key", "spearman_mean"]).to_markdown(index=False, floatfmt=".3f"), "\n",
+               "What the policy uses, per object (median plan change when removed vs an equally large set of "
+               "background patches):\n", po.to_markdown(index=False, floatfmt=".3f"), "\n"]
+        if len(ph):
+            ph.to_csv(os.path.join(figdir, "G_grounding_phase.csv"), index=False)
+            md += ["Before vs after the grasp (task state from the simulator): Expected IG's share and the "
+                   "measured effect per task object:\n", ph.to_markdown(index=False, floatfmt=".3f"), "\n"]
 
     text = "\n".join(md)
     with open(os.path.join(figdir, "RESULTS.md"), "w") as f:

@@ -12,6 +12,7 @@ that already exist, so an interrupted session resumes where it stopped.
      modality_timeline vision / language / state Shapley at every decision of whole episodes
   E  sanity           cascading model-parameter randomization (Adebayo et al. 2018)
   F  language         word x joint attribution (word removal + IG) and vision/language/state Shapley
+  G  grounding        attribution mass per scene object vs the plan change when that object is removed
 """
 import glob
 import json
@@ -23,9 +24,10 @@ import torch
 
 from .attribution import Explainer
 from .closedloop import run_condition
+from .grounding import Grounding, group_index, groups, replay_segmentation, to_groups
 from .language import LanguageExplainer
 from .metrics import Faithfulness, rank_agreement, topk_iou
-from .rollout import load_episode, make_env, rollout
+from .rollout import _render, load_episode, make_env, rollout
 
 
 def _dump(path, obj):
@@ -324,3 +326,66 @@ def modality_timeline(pol, rollout_dir, tasks, n_episodes, out, verbose=True):
                 v = v / (v.sum(1, keepdims=True) + 1e-12)
                 print(f"{os.path.basename(d)}  {len(rows)} decisions  vision share first/last "
                       f"{v[0, 0]:.2f}/{v[-1, 0]:.2f}  {time.time()-t0:.1f}s", flush=True)
+
+
+# ── G ─────────────────────────────────────────────────────────────────────────
+def episode_segmentation(d, seg_dir, env_for):
+    """Object ids of every frame the policy saw in episode `d` (replayed once, then cached)."""
+    os.makedirs(seg_dir, exist_ok=True)
+    npz, js = os.path.join(seg_dir, os.path.basename(d) + ".npz"), os.path.join(seg_dir, os.path.basename(d) + ".json")
+    if not os.path.exists(js):
+        with open(os.path.join(d, "episode.json")) as f:
+            meta = json.load(f)
+        segs, names, state, diffs = replay_segmentation(meta, d, env_for(meta["task"]), _render)
+        np.savez_compressed(npz, **{k: v.astype(np.int16) for k, v in segs.items()})
+        _dump(js, dict(names=names, state=state, rgb_diff_max=max(diffs, default=0.0),
+                       rgb_diff_mean=float(np.mean(diffs)) if diffs else 0.0))
+    with open(js) as f:
+        info = json.load(f)
+    z = np.load(npz)
+    return {k: z[k] for k in z.files}, {int(k): v for k, v in info["names"].items()}, info
+
+
+def grounding(pol, bench_dir, rollout_dir, out, fill="inpaint", render_backend=None, verbose=True):
+    """Stage G on the maps saved by `benchmark`: per moment, each method's attribution share on each
+    scene object vs the plan change when that object is removed (see grounding.py)."""
+    os.makedirs(out, exist_ok=True)
+    gr = Grounding(pol, fill=fill)
+    envs = {}
+    env_for = lambda task: envs.setdefault(task, make_env(task, render_backend))
+    cache = {}
+    try:
+        for f in sorted(glob.glob(os.path.join(bench_dir, "*.npz"))):
+            tag = os.path.basename(f)[:-4]
+            path = os.path.join(out, tag + ".json")
+            if os.path.exists(path):
+                continue
+            ep, c = tag.rsplit("_call", 1)
+            c, d = int(c), os.path.join(rollout_dir, ep)
+            segs, names, info = episode_segmentation(d, os.path.join(out, "seg"), env_for)
+            if info["rgb_diff_max"] > 1.0:
+                print(f"{ep}: replay differs from the saved frames (max mean |diff| {info['rgb_diff_max']:.2f}); "
+                      "skipped", flush=True)
+                continue
+            if d not in cache:
+                cache = {d: load_episode(d)}
+            meta = cache[d]
+            dp, cond = _cond(pol, meta, c)
+            lut, G = group_index(meta["task"], names), len(groups(meta["task"]))
+            gm = {k: None if f"call{c:03d}_{k}" not in segs else to_groups(segs[f"call{c:03d}_{k}"], lut, G)
+                  for k in ("prev", "curr")}
+            z = np.load(f)
+            t0 = time.time()
+            r = gr.evaluate(meta["task"], cond, dp["prev"], dp["curr"], gm["prev"], gm["curr"],
+                            {m: z[m] for m in z.files})
+            r.update(moment=tag, task=meta["task"], call=c, step=dp["step"], n_calls=meta["n_calls"],
+                     state=info["state"].get(str(c), {}), fill=fill, seconds=time.time() - t0)
+            _dump(path, r)
+            if verbose:
+                eff = ", ".join(f"{g}={e:.2f}" for g, e in zip(r["groups"], r["effect"]) if np.isfinite(e))
+                print(f"{tag}  effect of removing: {eff}  | eig claims "
+                      + ", ".join(f"{g}={v:.2f}" for g, v in zip(r["groups"], r["claim"]["eig"]))
+                      + f"  rho={r['spearman']['eig']:.2f}  {time.time()-t0:.1f}s", flush=True)
+    finally:
+        for e in envs.values():
+            e.close()

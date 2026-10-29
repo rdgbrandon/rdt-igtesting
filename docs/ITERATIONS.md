@@ -105,6 +105,12 @@ re-initialized, so maps that track SigLIP's input sensitivity can survive); pape
 causal sense (D) and the model-dependence sense (E), while deletion / insertion rankings are fill-dependent and
 disagree with E.
 
-## Iteration 4
+## Iteration 4 — object grounding (stage G)
 
-*(pending)*
+**Added:** `rdt_xai/grounding.py`. Each saved episode is replayed (seed + recorded actions, replayed RGB checked
+against the saved frames) to get the simulator's per-pixel object ids of the frames RDT saw. Per moment and method:
+attribution share per object (task objects, gripper, arm, background), and the plan change when that object is
+removed from both frames (inpainted) vs an equally large set of background patches. Scores: rank agreement between
+claimed share and measured effect, top-1 agreement, task-object enrichment, and the split before / after the grasp.
+
+*(results pending)*
