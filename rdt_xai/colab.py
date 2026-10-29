@@ -221,6 +221,44 @@ def _stream(cmd, cwd=None):
         raise RuntimeError(f"failed (exit {p.returncode}): {cmd}\n" + "".join(tail))
 
 
+_SAME_STEP = ('**({"autoreset_mode": gym.vector.AutoresetMode.SAME_STEP} '
+              'if hasattr(gym.vector, "AutoresetMode") else {})')
+DP_PATCHES = (
+    # CPU eval envs start with "forkserver"; ManiSkill's reset then touches CUDA in the child and fails ("Cannot
+    # re-initialize CUDA in forked subprocess"). "spawn" workers start clean. Gymnasium >= 1.0 also resets a
+    # finished env one step late by default (the policy would act on the last frame of the previous episode);
+    # same-step autoreset restores the gymnasium 0.29 behaviour the baseline was written for.
+    ("diffusion_policy/make_env.py",
+     ('gym.vector.AsyncVectorEnv(x, context="forkserver")', 'gym.vector.AsyncVectorEnv(x, context="spawn")'),
+     f'gym.vector.AsyncVectorEnv(x, context="spawn", {_SAME_STEP})'),
+    # gymnasium >= 1.0 reports the ending step's infos as a dict of arrays (final_info, or the info itself)
+    ("diffusion_policy/evaluate.py",
+     ('''                if isinstance(info["final_info"], dict):
+                    for k, v in info["final_info"]["episode"].items():
+                        eval_metrics[k].append(v.float().cpu().numpy())
+                else:
+                    for final_info in info["final_info"]:''',),
+     '''                final = info.get("final_info", info)
+                if isinstance(final, dict):
+                    for k, v in final["episode"].items():
+                        eval_metrics[k].extend(np.asarray(v.float().cpu().numpy() if hasattr(v, "cpu") else v).reshape(-1))
+                else:
+                    for final_info in final:'''),
+)
+
+
+def _patch_dp_baseline(code):
+    for rel, olds, new in DP_PATCHES:
+        path = f"{code}/{rel}"
+        src = open(path).read()
+        if new in src:
+            continue
+        old = next((o for o in olds if o in src), None)
+        if old is None:
+            raise RuntimeError(f"{rel}: code to patch not found (ManiSkill baseline changed?)")
+        open(path, "w").write(src.replace(old, new))
+
+
 def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
     """Train ManiSkill's Diffusion Policy baseline (train_rgbd.py, RGB, pd_ee_delta_pos, motion-planning demos)
     with the settings of its baselines.sh, in the current ManiSkill. Checkpoints go to
@@ -239,12 +277,7 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
             print(f"no tag {tag}; using ManiSkill main")
             sh(f"git clone -q --depth 1 https://github.com/haosulab/ManiSkill {MANISKILL_SRC}")
     code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
-    # its CPU eval envs start with "forkserver"; ManiSkill's reset then touches CUDA in the child, which fails
-    # ("Cannot re-initialize CUDA in forked subprocess") - fresh "spawn" workers do not inherit CUDA state
-    mk = f"{code}/diffusion_policy/make_env.py"
-    src = open(mk).read()
-    if 'context="forkserver"' in src:
-        open(mk, "w").write(src.replace('context="forkserver"', 'context="spawn"'))
+    _patch_dp_baseline(code)
     sh(f"pip install -q --no-deps -e {code}")
     sh('pip install -q tyro tensorboard h5py')
     raw = f"{DEMOS}/{task}/motionplanning/trajectory.h5"
