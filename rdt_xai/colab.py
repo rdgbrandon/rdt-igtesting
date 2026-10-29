@@ -312,6 +312,151 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
     return dst
 
 
+def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
+    """Why does a trained Diffusion Policy fail the baseline's evaluation? Each check isolates one stage:
+      1. a live env set to a demo's first state gives the training data's observation (rgb and state);
+      2. the demo's actions, replayed open loop from that state, still solve the task (controller);
+      3. the policy reproduces the demo's actions from training observations (network, preprocessing);
+      4. the policy solves fresh episodes in one plain env, stepping it by hand;
+      5. the same, through the baseline's own vector env and evaluate() (evaluation loop)."""
+    import json
+    import types
+    import gymnasium as gym
+    import numpy as np
+    import torch
+    import mani_skill
+    import mani_skill.envs  # noqa: F401
+    from mani_skill.trajectory import utils as trajectory_utils
+    from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack
+    from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
+    if code not in sys.path:
+        sys.path.insert(0, code)
+    cwd = os.getcwd()
+    os.chdir(code)
+    import diffusers
+    import train_rgbd as T
+    from diffusion_policy.evaluate import evaluate
+    from diffusion_policy.make_env import make_eval_envs
+    import h5py
+    from diffusion_policy.utils import build_state_obs_extractor, load_content_from_h5_file
+    describe = subprocess.run(f"git -C {MANISKILL_SRC} describe --tags --always", shell=True, capture_output=True,
+                              text=True).stdout.strip()
+    print(f"mani_skill {mani_skill.__version__} (baseline code {describe}), gymnasium {gym.__version__} "
+          f"(AutoresetMode: {hasattr(gym.vector, 'AutoresetMode')}), diffusers {diffusers.__version__}, "
+          f"torch {torch.__version__}, numpy {np.__version__}")
+    rgb_path = f"{DEMOS}/{task}/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
+    meta = json.load(open(rgb_path[:-2] + "json"))
+    steps = DP_SETTINGS.get(task, (200, 100000))[0]
+    env_kwargs = dict(control_mode="pd_ee_delta_pos", reward_mode="sparse", obs_mode="rgb", render_mode="rgb_array",
+                      human_render_camera_configs=dict(shader_pack="default"), max_episode_steps=steps)
+    ep = meta["episodes"][demo]
+    with h5py.File(rgb_path, "r") as f:
+        traj = load_content_from_h5_file(f[f"traj_{ep['episode_id']}"])
+    extract = build_state_obs_extractor(task)
+    raw_env = gym.make(task, reconfiguration_freq=1, **env_kwargs)
+    space = raw_env.observation_space                 # the dataset reorders the h5 keys to this
+    traj["obs"] = T.reorder_keys(traj["obs"], space)
+    live_keys = {k: list(v.keys()) for k, v in raw_env.unwrapped.get_obs().items() if k in ("agent", "extra")}
+    space_keys = {k: list(space[k].keys()) for k in live_keys}
+    print(f"state keys: live {live_keys}" + ("" if live_keys == space_keys else f"  !! dataset order {space_keys}"))
+
+    def demo_state(o):
+        parts = [np.asarray(x, dtype=np.float32) for x in extract(o)]
+        return np.column_stack([x.reshape(len(x), -1) for x in parts])
+
+    cam = next(iter(traj["obs"]["sensor_data"]))
+    d_rgb, d_state, d_act = traj["obs"]["sensor_data"][cam]["rgb"], demo_state(traj["obs"]), traj["actions"]
+    print(f"demo {ep['episode_id']}: {len(d_act)} actions, camera {cam} {d_rgb.shape[1:]}, state dim "
+          f"{d_state.shape[1]}, |action| mean {np.abs(d_act).mean(0).round(3).tolist()}")
+    if d_rgb.max() == 0:
+        print("  !! the training images are all black")
+
+    # 1. same state, same observation?
+    env = FlattenRGBDObservationWrapper(raw_env)
+    env.reset(**ep["reset_kwargs"])
+    states = trajectory_utils.dict_to_list_of_dicts(traj["env_states"])
+    env.unwrapped.set_state_dict(states[0])
+    live = env.observation(env.unwrapped.get_obs())
+    l_rgb, l_state = live["rgb"][0].cpu().numpy(), live["state"][0].cpu().numpy()
+    px = np.abs(l_rgb.astype(np.float32) - d_rgb[0].astype(np.float32))
+    print(f"1. observation: live state dim {l_state.shape[0]} vs demo {d_state.shape[1]}; ", end="")
+    if l_state.shape[0] == d_state.shape[1]:
+        diff = np.abs(l_state - d_state[0])
+        print(f"max |state diff| {diff.max():.4f} (at dims {np.argsort(diff)[::-1][:3].tolist()}); ", end="")
+    print(f"rgb mean |diff| {px.mean():.2f}/255, max {px.max():.0f}; live rgb mean {l_rgb.mean():.1f}, "
+          f"demo rgb mean {d_rgb[0].mean():.1f}")
+    try:
+        from PIL import Image
+        Image.fromarray(np.concatenate([d_rgb[0], l_rgb], 1)).resize((512, 256), Image.NEAREST).save(
+            f"{out_drive}/dp/{task}/diag_demo_vs_live.png")
+    except Exception as e:
+        print("   (image not saved:", e, ")")
+
+    # 2. open-loop replay of the demo actions
+    succ = False
+    for a in d_act:
+        _, _, _, _, info = env.step(a)
+        succ = succ or bool(np.asarray(info["success"]).any())
+    print(f"2. demo actions replayed open loop: {'success' if succ else 'FAIL'}")
+    env.close()
+
+    # the policy, exactly as the baseline builds it
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    chain = CPUGymWrapper(FrameStack(FlattenRGBDObservationWrapper(gym.make(task, reconfiguration_freq=1, **env_kwargs)),
+                                     num_stack=2), ignore_terminations=True, record_metrics=True)
+    spaces = types.SimpleNamespace(single_observation_space=chain.observation_space,
+                                   single_action_space=chain.action_space)
+    args = T.Args(env_id=task, obs_mode="rgb", control_mode="pd_ee_delta_pos", max_episode_steps=steps)
+    agent = T.Agent(spaces, args).to(device)
+    path = ckpt if os.path.isabs(ckpt) else f"{out_drive}/dp/{task}/{ckpt}"
+    agent.load_state_dict(torch.load(path, map_location=device)["ema_agent"])
+    agent.eval()
+    print(f"policy {path}")
+
+    def act(rgb, state):                         # rgb (2, H, W, C) uint8, state (2, D)
+        obs = dict(rgb=torch.as_tensor(np.asarray(rgb))[None].to(device),
+                   state=torch.as_tensor(np.asarray(state, dtype=np.float32))[None].to(device))
+        return agent.get_action(obs)[0].cpu().numpy()
+
+    # 3. the demo's actions from training observations (frames t-1, t; padded at the start like the dataset)
+    errs, base = [], []
+    for t in range(0, len(d_act) - 8, max(1, (len(d_act) - 8) // 6)):
+        i = [max(t - 1, 0), t]
+        pred = act(d_rgb[i], d_state[i])
+        errs.append(np.abs(pred - d_act[t:t + 8]).mean())
+        base.append(np.abs(d_act.mean(0) - d_act[t:t + 8]).mean())
+    print(f"3. policy vs demo actions on training observations: mean |error| {np.mean(errs):.3f} "
+          f"(predicting the mean action: {np.mean(base):.3f})")
+
+    # 4. closed loop, one env stepped by hand
+    wins, lens = 0, []
+    for k in range(episodes):
+        obs, _ = chain.reset(seed=1000 + k)
+        done, n, ok = False, 0, False
+        while not done:
+            for a in act(obs["rgb"], obs["state"]):
+                obs, _, term, trunc, info = chain.step(a)
+                n += 1
+                ok = ok or bool(info["success"])
+                done = bool(term or trunc)
+                if done:
+                    break
+        wins += ok
+        lens.append(n)
+    print(f"4. closed loop, plain env: {wins}/{episodes} solved (episode length {np.mean(lens):.0f})")
+    chain.close()
+
+    # 5. the baseline's own evaluation path
+    envs = make_eval_envs(task, min(episodes, 10), "physx_cpu", env_kwargs, dict(obs_horizon=2), video_dir=None,
+                          wrappers=[FlattenRGBDObservationWrapper])
+    m = evaluate(episodes, agent, envs, device, "physx_cpu", progress_bar=False)
+    envs.close()
+    print(f"5. baseline evaluate(): success_once {np.mean(m['success_once']):.2f} over {len(m['success_once'])} "
+          f"values, episode_len {np.mean(m['episode_len']):.0f}")
+    os.chdir(cwd)
+
+
 PAPER = {"PickCube-v1": 0.772, "StackCube-v1": 0.74, "PushCube-v1": 1.0, "PegInsertionSide-v1": 0.132,
          "PlugCharger-v1": 0.012}
 
