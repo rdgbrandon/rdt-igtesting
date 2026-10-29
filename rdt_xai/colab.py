@@ -202,6 +202,77 @@ def show_report(out, out_drive=None):
         print("synced", sync(out, out_drive), "files ->", out_drive)
 
 
+# ── second policy: ManiSkill's official Diffusion Policy baseline (RGB) ──────────────────
+MANISKILL_SRC = "/content/ManiSkill"
+DP_SETTINGS = {"PickCube-v1": (100, 30000), "PushCube-v1": (100, 30000), "StackCube-v1": (200, 100000)}
+DEMOS = os.path.expanduser("~/.maniskill/demos")
+
+
+def _stream(cmd, cwd=None):
+    """Run a command, printing its output as it comes; raise with the tail if it fails."""
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         bufsize=1)
+    tail = []
+    for line in p.stdout:
+        tail = (tail + [line])[-40:]
+        if "warn" not in line.lower():
+            print(line.rstrip(), flush=True)
+    if p.wait() != 0:
+        raise RuntimeError(f"failed (exit {p.returncode}): {cmd}\n" + "".join(tail))
+
+
+def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
+    """Train ManiSkill's Diffusion Policy baseline (train_rgbd.py, RGB, pd_ee_delta_pos, motion-planning demos)
+    with the settings of its baselines.sh, in the current ManiSkill. Checkpoints go to
+    <out_drive>/dp/<task>/. Skipped if a final checkpoint is already there."""
+    import glob
+    import json
+    dst = f"{out_drive}/dp/{task}"
+    if os.path.exists(f"{dst}/final.pt"):
+        print(f"{task}: trained checkpoint already in {dst}")
+        return dst
+    import mani_skill
+    if not os.path.exists(MANISKILL_SRC):              # baseline code from the installed ManiSkill release
+        tag = "v" + mani_skill.__version__
+        if subprocess.run(f"git clone -q --depth 1 --branch {tag} https://github.com/haosulab/ManiSkill {MANISKILL_SRC}",
+                          shell=True).returncode != 0:
+            print(f"no tag {tag}; using ManiSkill main")
+            sh(f"git clone -q --depth 1 https://github.com/haosulab/ManiSkill {MANISKILL_SRC}")
+    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
+    sh(f"pip install -q --no-deps -e {code}")
+    sh('pip install -q tyro tensorboard h5py')
+    raw = f"{DEMOS}/{task}/motionplanning/trajectory.h5"
+    rgb = f"{DEMOS}/{task}/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
+    if not os.path.exists(raw):
+        _stream(f"{sys.executable} -m mani_skill.utils.download_demo {task}")
+    if not os.path.exists(rgb):
+        _stream(f"{sys.executable} -m mani_skill.trajectory.replay_trajectory --traj-path {raw} --use-first-env-state "
+                f"-c pd_ee_delta_pos -o rgb --save-traj --num-envs 10 -b physx_cpu")
+    steps, iters = DP_SETTINGS.get(task, (200, 100000))
+    iters = total_iters or iters
+    name = f"dp-{task}-rgb-{demos}demos-s{seed}"
+    _stream(f"{sys.executable} train_rgbd.py --env-id {task} --demo-path {rgb} --control-mode pd_ee_delta_pos "
+            f"--sim-backend physx_cpu --num-demos {demos} --max_episode_steps {steps} --total_iters {iters} "
+            f"--obs-mode rgb --exp-name {name} --demo_type=motionplanning --seed {seed} --save_freq 5000", cwd=code)
+    os.makedirs(dst, exist_ok=True)
+    ck = sorted(glob.glob(f"{code}/runs/{name}/checkpoints/*.pt"))
+    for f in ck:
+        shutil.copy(f, f"{dst}/{os.path.basename(f)}")
+    # numbered checkpoints stop at the last multiple of save_freq below total_iters; the baseline's own
+    # pick is the best evaluation success at the end of an eval round
+    numbered = sorted((f for f in ck if os.path.basename(f)[:-3].isdigit()), key=lambda f: int(os.path.basename(f)[:-3]))
+    best = [f for f in ck if os.path.basename(f) == "best_eval_success_at_end.pt"]
+    final = (best or numbered[-1:] or [None])[0]
+    if final:
+        shutil.copy(final, f"{dst}/final.pt")
+    json.dump(dict(task=task, demos=demos, total_iters=iters, max_episode_steps=steps, seed=seed, run=name,
+                   maniskill=mani_skill.__version__, checkpoints=[os.path.basename(f) for f in ck],
+                   final=os.path.basename(final) if final else None),
+              open(f"{dst}/train.json", "w"), indent=1)
+    print(f"{task}: {len(ck)} checkpoints -> {dst}")
+    return dst
+
+
 PAPER = {"PickCube-v1": 0.772, "StackCube-v1": 0.74, "PushCube-v1": 1.0, "PegInsertionSide-v1": 0.132,
          "PlugCharger-v1": 0.012}
 
