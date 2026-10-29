@@ -223,6 +223,27 @@ def _stream(cmd, cwd=None):
 
 _SAME_STEP = ('**({"autoreset_mode": gym.vector.AutoresetMode.SAME_STEP} '
               'if hasattr(gym.vector, "AutoresetMode") else {})')
+_SPACE_ORDER = '''from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+
+
+def _space_order(obs, space):
+    if not hasattr(space, "keys"):
+        return obs
+    return {k: _space_order(obs[k], space[k]) for k in space.keys() if k in obs}
+
+
+class SpaceOrderFlatten(FlattenRGBDObservationWrapper):
+    """FlattenRGBDObservationWrapper that concatenates the state in the key order of the env's (batched)
+    observation space, the order train_rgbd.py puts the training data in. gymnasium >= 1.0's batch_space rebuilds
+    Dict spaces from plain dicts, which sorts their keys, so that order is no longer the env's own dict order."""
+
+    def __init__(self, env, *args, **kwargs):
+        self._raw_space = env.unwrapped.observation_space
+        super().__init__(env, *args, **kwargs)
+
+    def observation(self, observation):
+        return super().observation(_space_order(observation, self._raw_space))
+'''
 DP_PATCHES = (
     # CPU eval envs start with "forkserver"; ManiSkill's reset then touches CUDA in the child and fails ("Cannot
     # re-initialize CUDA in forked subprocess"). "spawn" workers start clean. Gymnasium >= 1.0 also resets a
@@ -244,6 +265,16 @@ DP_PATCHES = (
                         eval_metrics[k].extend(np.asarray(v.float().cpu().numpy() if hasattr(v, "cpu") else v).reshape(-1))
                 else:
                     for final_info in final:'''),
+    # gymnasium >= 1.0's batch_space sorts Dict keys, so the env's batched observation_space, whose order the
+    # dataset puts the h5 keys in, is alphabetical (extra: goal_pos, is_grasped, tcp_pose); FlattenRGBDObservationWrapper
+    # concatenates live obs in the env's dict order (is_grasped, tcp_pose, goal_pos): the evaluated policy got the
+    # goal where it learned the gripper pose and failed every episode. Flatten live obs in the space order.
+    ("diffusion_policy/make_env.py",
+     ("from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv\n",),
+     "from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv\n" + _SPACE_ORDER),
+    ("train_rgbd.py", ("from diffusion_policy.make_env import make_eval_envs",),
+     "from diffusion_policy.make_env import SpaceOrderFlatten, make_eval_envs"),
+    ("train_rgbd.py", ("        wrappers=[FlattenRGBDObservationWrapper],",), "        wrappers=[SpaceOrderFlatten],"),
 )
 
 
@@ -309,7 +340,97 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
                    final=os.path.basename(final) if final else None),
               open(f"{dst}/train.json", "w"), indent=1)
     print(f"{task}: {len(ck)} checkpoints -> {dst}")
+    if final:
+        dp_evaluate(task, out_drive)
     return dst
+
+
+def _dp_baseline():
+    """The patched baseline's modules (make_env, evaluate, train_rgbd), reloaded so a patch made after a first
+    import takes effect."""
+    import importlib
+    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
+    _patch_dp_baseline(code)
+    if code not in sys.path:
+        sys.path.insert(0, code)
+    import diffusion_policy.evaluate
+    import diffusion_policy.make_env
+    import train_rgbd
+    return tuple(importlib.reload(m) for m in (diffusion_policy.make_env, diffusion_policy.evaluate, train_rgbd))
+
+
+def _dp_env_kwargs(task):
+    return dict(control_mode="pd_ee_delta_pos", reward_mode="sparse", obs_mode="rgb", render_mode="rgb_array",
+                human_render_camera_configs=dict(shader_pack="default"),
+                max_episode_steps=DP_SETTINGS.get(task, (200, 100000))[0])
+
+
+def _dp_agent(T, make_env, task, path):
+    """The baseline's Agent with a checkpoint's EMA weights, and the single-env wrapper chain it was built for."""
+    import types
+    import gymnasium as gym
+    import torch
+    from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack
+    kw = _dp_env_kwargs(task)
+    chain = CPUGymWrapper(FrameStack(make_env.SpaceOrderFlatten(gym.make(task, reconfiguration_freq=1, **kw)),
+                                     num_stack=2), ignore_terminations=True, record_metrics=True)
+    spaces = types.SimpleNamespace(single_observation_space=chain.observation_space,
+                                   single_action_space=chain.action_space)
+    args = T.Args(env_id=task, obs_mode="rgb", control_mode="pd_ee_delta_pos", max_episode_steps=kw["max_episode_steps"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = T.Agent(spaces, args).to(device)
+    agent.load_state_dict(torch.load(path, map_location=device)["ema_agent"])
+    agent.eval()
+    return agent, chain, device
+
+
+def _dp_ckpt(task, out_drive, ckpt):
+    return ckpt if os.path.isabs(ckpt) else f"{out_drive}/dp/{task}/{ckpt}"
+
+
+def dp_evaluate(task, out_drive, ckpt="final.pt", episodes=100):
+    """Success rate of a checkpoint through the baseline's (patched) evaluation: 10 CPU envs, the task's training
+    max_episode_steps, fresh random episodes. Saved as <out_drive>/dp/<task>/eval_<ckpt name>.json."""
+    import json
+    import numpy as np
+    make_env, ev, T = _dp_baseline()
+    path = _dp_ckpt(task, out_drive, ckpt)
+    agent, chain, device = _dp_agent(T, make_env, task, path)
+    chain.close()
+    envs = make_env.make_eval_envs(task, 10, "physx_cpu", _dp_env_kwargs(task), dict(obs_horizon=2), video_dir=None,
+                                   wrappers=[make_env.SpaceOrderFlatten])
+    m = ev.evaluate(episodes, agent, envs, device, "physx_cpu")
+    envs.close()
+    r = {k: float(np.mean(v)) for k, v in m.items() if not k.startswith("_")}
+    r.update(task=task, ckpt=path, episodes=int(len(m["success_once"])))
+    print(f"{task} {os.path.basename(path)}: success_once {r['success_once']:.2f}, "
+          f"success_at_end {r['success_at_end']:.2f} over {r['episodes']} episodes")
+    os.makedirs(f"{out_drive}/dp/{task}", exist_ok=True)
+    json.dump(r, open(f"{out_drive}/dp/{task}/eval_{os.path.basename(path)[:-3]}.json", "w"), indent=1)
+    return r
+
+
+def dp_adopt(task, out_drive, ckpt, demos=100, seed=1, episodes=100):
+    """Make a checkpoint of an earlier training run (on this runtime's disk) the task's final.pt, without
+    retraining: copy that run's checkpoints to Drive, then evaluate it with the fixed evaluation."""
+    import glob
+    import json
+    import mani_skill
+    name = f"dp-{task}-rgb-{demos}demos-s{seed}"
+    run = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy/runs/{name}/checkpoints"
+    dst = f"{out_drive}/dp/{task}"
+    os.makedirs(dst, exist_ok=True)
+    ck = sorted(glob.glob(f"{run}/*.pt"))
+    for f in ck:
+        shutil.copy(f, f"{dst}/{os.path.basename(f)}")
+    src = ckpt if os.path.isabs(ckpt) else f"{run}/{ckpt}"
+    shutil.copy(src, f"{dst}/final.pt")
+    steps, iters = DP_SETTINGS.get(task, (200, 100000))
+    json.dump(dict(task=task, demos=demos, total_iters=iters, max_episode_steps=steps, seed=seed, run=name,
+                   maniskill=mani_skill.__version__, checkpoints=[os.path.basename(f) for f in ck],
+                   final=os.path.basename(src), adopted=True), open(f"{dst}/train.json", "w"), indent=1)
+    print(f"{task}: {os.path.basename(src)} -> {dst}/final.pt ({len(ck)} checkpoints copied)")
+    return dp_evaluate(task, out_drive, "final.pt", episodes)
 
 
 def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
@@ -320,25 +441,15 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
       4. the policy solves fresh episodes in one plain env, stepping it by hand;
       5. the same, through the baseline's own vector env and evaluate() (evaluation loop)."""
     import json
-    import types
     import gymnasium as gym
+    import h5py
     import numpy as np
     import torch
+    import diffusers
     import mani_skill
     import mani_skill.envs  # noqa: F401
     from mani_skill.trajectory import utils as trajectory_utils
-    from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack
-    from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
-    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
-    if code not in sys.path:
-        sys.path.insert(0, code)
-    cwd = os.getcwd()
-    os.chdir(code)
-    import diffusers
-    import train_rgbd as T
-    from diffusion_policy.evaluate import evaluate
-    from diffusion_policy.make_env import make_eval_envs
-    import h5py
+    make_env, ev, T = _dp_baseline()
     from diffusion_policy.utils import build_state_obs_extractor, load_content_from_h5_file
     describe = subprocess.run(f"git -C {MANISKILL_SRC} describe --tags --always", shell=True, capture_output=True,
                               text=True).stdout.strip()
@@ -347,9 +458,7 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
           f"torch {torch.__version__}, numpy {np.__version__}")
     rgb_path = f"{DEMOS}/{task}/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
     meta = json.load(open(rgb_path[:-2] + "json"))
-    steps = DP_SETTINGS.get(task, (200, 100000))[0]
-    env_kwargs = dict(control_mode="pd_ee_delta_pos", reward_mode="sparse", obs_mode="rgb", render_mode="rgb_array",
-                      human_render_camera_configs=dict(shader_pack="default"), max_episode_steps=steps)
+    env_kwargs = _dp_env_kwargs(task)
     ep = meta["episodes"][demo]
     with h5py.File(rgb_path, "r") as f:
         traj = load_content_from_h5_file(f[f"traj_{ep['episode_id']}"])
@@ -359,7 +468,8 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
     traj["obs"] = T.reorder_keys(traj["obs"], space)
     live_keys = {k: list(v.keys()) for k, v in raw_env.unwrapped.get_obs().items() if k in ("agent", "extra")}
     space_keys = {k: list(space[k].keys()) for k in live_keys}
-    print(f"state keys: live {live_keys}" + ("" if live_keys == space_keys else f"  !! dataset order {space_keys}"))
+    print(f"state keys: env {live_keys}" + ("" if live_keys == space_keys else
+                                            f"; space/dataset {space_keys} (the eval flattens in this order)"))
 
     def demo_state(o):
         parts = [np.asarray(x, dtype=np.float32) for x in extract(o)]
@@ -373,7 +483,7 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
         print("  !! the training images are all black")
 
     # 1. same state, same observation?
-    env = FlattenRGBDObservationWrapper(raw_env)
+    env = make_env.SpaceOrderFlatten(raw_env)
     env.reset(**ep["reset_kwargs"])
     states = trajectory_utils.dict_to_list_of_dicts(traj["env_states"])
     env.unwrapped.set_state_dict(states[0])
@@ -388,6 +498,7 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
           f"demo rgb mean {d_rgb[0].mean():.1f}")
     try:
         from PIL import Image
+        os.makedirs(f"{out_drive}/dp/{task}", exist_ok=True)
         Image.fromarray(np.concatenate([d_rgb[0], l_rgb], 1)).resize((512, 256), Image.NEAREST).save(
             f"{out_drive}/dp/{task}/diag_demo_vs_live.png")
     except Exception as e:
@@ -401,17 +512,8 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
     print(f"2. demo actions replayed open loop: {'success' if succ else 'FAIL'}")
     env.close()
 
-    # the policy, exactly as the baseline builds it
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    chain = CPUGymWrapper(FrameStack(FlattenRGBDObservationWrapper(gym.make(task, reconfiguration_freq=1, **env_kwargs)),
-                                     num_stack=2), ignore_terminations=True, record_metrics=True)
-    spaces = types.SimpleNamespace(single_observation_space=chain.observation_space,
-                                   single_action_space=chain.action_space)
-    args = T.Args(env_id=task, obs_mode="rgb", control_mode="pd_ee_delta_pos", max_episode_steps=steps)
-    agent = T.Agent(spaces, args).to(device)
-    path = ckpt if os.path.isabs(ckpt) else f"{out_drive}/dp/{task}/{ckpt}"
-    agent.load_state_dict(torch.load(path, map_location=device)["ema_agent"])
-    agent.eval()
+    path = _dp_ckpt(task, out_drive, ckpt)
+    agent, chain, device = _dp_agent(T, make_env, task, path)
     print(f"policy {path}")
 
     def act(rgb, state):                         # rgb (2, H, W, C) uint8, state (2, D)
@@ -448,13 +550,12 @@ def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
     chain.close()
 
     # 5. the baseline's own evaluation path
-    envs = make_eval_envs(task, min(episodes, 10), "physx_cpu", env_kwargs, dict(obs_horizon=2), video_dir=None,
-                          wrappers=[FlattenRGBDObservationWrapper])
-    m = evaluate(episodes, agent, envs, device, "physx_cpu", progress_bar=False)
+    envs = make_env.make_eval_envs(task, min(episodes, 10), "physx_cpu", env_kwargs, dict(obs_horizon=2),
+                                   video_dir=None, wrappers=[make_env.SpaceOrderFlatten])
+    m = ev.evaluate(episodes, agent, envs, device, "physx_cpu", progress_bar=False)
     envs.close()
     print(f"5. baseline evaluate(): success_once {np.mean(m['success_once']):.2f} over {len(m['success_once'])} "
           f"values, episode_len {np.mean(m['episode_len']):.0f}")
-    os.chdir(cwd)
 
 
 PAPER = {"PickCube-v1": 0.772, "StackCube-v1": 0.74, "PushCube-v1": 1.0, "PegInsertionSide-v1": 0.132,
