@@ -239,6 +239,12 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
             print(f"no tag {tag}; using ManiSkill main")
             sh(f"git clone -q --depth 1 https://github.com/haosulab/ManiSkill {MANISKILL_SRC}")
     code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
+    # its CPU eval envs start with "forkserver"; ManiSkill's reset then touches CUDA in the child, which fails
+    # ("Cannot re-initialize CUDA in forked subprocess") - fresh "spawn" workers do not inherit CUDA state
+    mk = f"{code}/diffusion_policy/make_env.py"
+    src = open(mk).read()
+    if 'context="forkserver"' in src:
+        open(mk, "w").write(src.replace('context="forkserver"', 'context="spawn"'))
     sh(f"pip install -q --no-deps -e {code}")
     sh('pip install -q tyro tensorboard h5py')
     raw = f"{DEMOS}/{task}/motionplanning/trajectory.h5"
