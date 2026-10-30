@@ -134,7 +134,8 @@ Colab stack: gymnasium 1.4.0, diffusers 0.42, torch 2.11, numpy 2.1, Python 3.13
   runs these checks.
 
 **Result:** PickCube, same 25k checkpoint, fixed eval, 100 fresh episodes: success_once 0.91, success_at_end 0.62.
-PushCube: *(training)*.
+PushCube, 25k checkpoint, same eval: success_once 0.86, success_at_end 0.86 (100 episodes). Both checkpoints are
+25k-iteration EMA weights (numbered saves stop at the last multiple of 5000 below 30k).
 
 **Caveat for any DP number:** a policy trained before the fix is fine; only its in-training eval scores (and so
 `best_eval_*.pt`) are wrong. The attribution adapter must build the state in the same sorted order.
