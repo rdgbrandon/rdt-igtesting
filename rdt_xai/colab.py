@@ -469,6 +469,34 @@ def dp_adopt(task, out_drive, ckpt, demos=100, seed=1, episodes=100):
     return dp_evaluate(task, out_drive, "final.pt", episodes)
 
 
+def dp_xai(task, out_drive, stages="A,B,C,D,E,F", ckpt="final.pt", **cfg):
+    """The attribution study's stages on a task's trained Diffusion Policy (scripts/run_dp.py; options
+    as its flags, e.g. a_episodes=20, b_moments=40, b_fast=True). Results go to <out_drive>/dp_xai/<task>/,
+    synced every 5 min and at the end; a rerun resumes where the last one stopped."""
+    code = _dp_code()
+    os.environ["DP_CODE"] = code
+    local, remote = f"{OUT}/dp_xai", f"{out_drive}/dp_xai"
+    if os.path.exists(remote):
+        sync(remote, local)
+    flags = " ".join(f"--{k}" if v is True else f"--{k} {v}" for k, v in cfg.items() if v is not False)
+    stop = threading.Event()
+
+    def loop():
+        while not stop.wait(300):
+            try:
+                sync(local, remote)
+            except Exception as e:                     # never kill the run because Drive hiccuped
+                print("sync:", e)
+    threading.Thread(target=loop, daemon=True).start()
+    try:
+        _stream(f"{sys.executable} scripts/run_dp.py --task {task} --ckpt {_dp_ckpt(task, out_drive, ckpt)} "
+                f"--out {local} --stages {stages} {flags}", cwd=REPO)
+    finally:
+        stop.set()
+        sync(local, remote)
+    return open(f"{local}/{task}/summary.txt").read()
+
+
 def dp_diagnose(task, out_drive, ckpt="final.pt", episodes=10, demo=0):
     """Why does a trained Diffusion Policy fail the baseline's evaluation? Each check isolates one stage:
       1. a live env set to a demo's first state gives the training data's observation (rgb and state);

@@ -138,3 +138,11 @@ PushCube: *(training)*.
 
 **Caveat for any DP number:** a policy trained before the fix is fine; only its in-training eval scores (and so
 `best_eval_*.pt`) are wrong. The attribution adapter must build the state in the same sorted order.
+
+**Adapter (`rdt_xai/dp.py`, `rdt_xai/dp_stages.py`, `scripts/run_dp.py`, `notebooks/dp_xai.ipynb`):** the study's
+stages on the DP checkpoint, in pixel space (2 frames x 128x128, 16x16 grid of 8-px patches). No-vision input =
+mean frame of the stage-A episodes (DP never saw a missing camera); 100 DDPM steps in 5 bins of 20 for C; DAAM /
+GAE replaced by Grad-CAM (CNN encoder); G uses the sensor camera's own segmentation, recorded live (no replay).
+`tests/test_dp.py` (random Agent, fake env, CPU): the written-out DDPM update equals diffusers' step exactly,
+conditioning equals `Agent.encode_obs`, EIG completeness error 0.3%, bins sum to EIG, full removal = no-vision
+image, all stages run.
