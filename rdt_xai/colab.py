@@ -317,9 +317,9 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
     rgb = f"{DEMOS}/{task}/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
     if not os.path.exists(raw):
         _stream(f"{sys.executable} -m mani_skill.utils.download_demo {task}")
-    if not os.path.exists(rgb):
+    if not os.path.exists(rgb):                         # only 2x the demos trained on: a few fail to convert
         _stream(f"{sys.executable} -m mani_skill.trajectory.replay_trajectory --traj-path {raw} --use-first-env-state "
-                f"-c pd_ee_delta_pos -o rgb --save-traj --num-envs 10 -b physx_cpu")
+                f"-c pd_ee_delta_pos -o rgb --save-traj --num-envs 10 -b physx_cpu --count {2 * demos}")
     os.makedirs(dst, exist_ok=True)
     stop = threading.Event()
 
