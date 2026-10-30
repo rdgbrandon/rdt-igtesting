@@ -106,12 +106,13 @@ class DPPolicy:
         """bg: (H, W, 3) uint8 or (3, H, W) float no-vision image (default mid-grey)."""
         if bg is None:
             bg = np.full((IMG, IMG, 3), 127, np.uint8)
-        bg = torch.as_tensor(np.asarray(bg))
+        bg = bg if torch.is_tensor(bg) else torch.as_tensor(np.asarray(bg))     # tensors may live on the GPU
         if bg.dtype == torch.uint8:
             bg = bg.permute(2, 0, 1).float() / 255
         self.bg = bg.to(self.device, self.dtype)                          # (3, H, W)
         self.state_mean = None if state_mean is None else torch.as_tensor(
-            np.asarray(state_mean, np.float32), device=self.device)
+            state_mean if torch.is_tensor(state_mean) else np.asarray(state_mean, np.float32)).to(self.device,
+                                                                                                torch.float32)
 
     # inputs
     def pixels(self, frames):
