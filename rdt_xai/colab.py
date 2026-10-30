@@ -58,6 +58,7 @@ def vulkan():
 
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 _SYNC_LOCK = threading.Lock()
@@ -301,16 +302,17 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
         print(f"{task}: trained checkpoint already in {dst}")
         return dst
     import mani_skill
-    if not os.path.exists(MANISKILL_SRC):              # baseline code from the installed ManiSkill release
-        tag = "v" + mani_skill.__version__
-        if subprocess.run(f"git clone -q --depth 1 --branch {tag} https://github.com/haosulab/ManiSkill {MANISKILL_SRC}",
-                          shell=True).returncode != 0:
-            print(f"no tag {tag}; using ManiSkill main")
-            sh(f"git clone -q --depth 1 https://github.com/haosulab/ManiSkill {MANISKILL_SRC}")
-    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
-    _patch_dp_baseline(code)
-    sh(f"pip install -q --no-deps -e {code}")
-    sh('pip install -q tyro tensorboard h5py')
+    code = _dp_code()
+    steps, iters = DP_SETTINGS.get(task, (200, 100000))
+    iters = total_iters or iters
+    name = f"dp-{task}-rgb-{demos}demos-s{seed}"
+    run = f"{code}/runs/{name}/checkpoints"
+    last = (iters - 1) // 5000 * 5000                   # the last numbered checkpoint a finished run saves
+    for d in (run, dst):                                # a run that got that far before a disconnect
+        if os.path.exists(f"{d}/{last}.pt"):
+            print(f"{task}: {last}.pt of an earlier run is in {d}; using it instead of retraining")
+            dp_adopt(task, out_drive, f"{d}/{last}.pt", demos, seed)
+            return dst
     raw = f"{DEMOS}/{task}/motionplanning/trajectory.h5"
     rgb = f"{DEMOS}/{task}/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
     if not os.path.exists(raw):
@@ -318,14 +320,28 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
     if not os.path.exists(rgb):
         _stream(f"{sys.executable} -m mani_skill.trajectory.replay_trajectory --traj-path {raw} --use-first-env-state "
                 f"-c pd_ee_delta_pos -o rgb --save-traj --num-envs 10 -b physx_cpu")
-    steps, iters = DP_SETTINGS.get(task, (200, 100000))
-    iters = total_iters or iters
-    name = f"dp-{task}-rgb-{demos}demos-s{seed}"
-    _stream(f"{sys.executable} train_rgbd.py --env-id {task} --demo-path {rgb} --control-mode pd_ee_delta_pos "
-            f"--sim-backend physx_cpu --num-demos {demos} --max_episode_steps {steps} --total_iters {iters} "
-            f"--obs-mode rgb --exp-name {name} --demo_type=motionplanning --seed {seed} --save_freq 5000", cwd=code)
     os.makedirs(dst, exist_ok=True)
-    ck = sorted(glob.glob(f"{code}/runs/{name}/checkpoints/*.pt"))
+    stop = threading.Event()
+
+    def backup():                                       # the baseline cannot resume, so keep what it saved
+        while not stop.wait(60):
+            for f in glob.glob(f"{run}/*.pt"):
+                b = f"{dst}/{os.path.basename(f)}"
+                try:                                    # skip files torch.save may still be writing
+                    if time.time() - os.path.getmtime(f) > 30 and (
+                            not os.path.exists(b) or os.path.getmtime(f) > os.path.getmtime(b)):
+                        shutil.copyfile(f, b)
+                except OSError as e:
+                    print("checkpoint backup:", e)
+    threading.Thread(target=backup, daemon=True).start()
+    try:
+        _stream(f"{sys.executable} train_rgbd.py --env-id {task} --demo-path {rgb} --control-mode pd_ee_delta_pos "
+            f"--sim-backend physx_cpu --num-demos {demos} --max_episode_steps {steps} --total_iters {iters} "
+                f"--obs-mode rgb --exp-name {name} --demo_type=motionplanning --seed {seed} --save_freq 5000",
+                cwd=code)
+    finally:
+        stop.set()
+    ck = sorted(glob.glob(f"{run}/*.pt"))
     for f in ck:
         shutil.copy(f, f"{dst}/{os.path.basename(f)}")
     # numbered checkpoints stop at the last multiple of save_freq below total_iters; the baseline's own
@@ -345,12 +361,32 @@ def train_dp(task, out_drive, demos=100, total_iters=None, seed=1):
     return dst
 
 
+def _dp_code():
+    """ManiSkill's Diffusion Policy baseline code of the installed release: cloned, patched, installed."""
+    import mani_skill
+    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
+    if not os.path.exists(MANISKILL_SRC):
+        tag = "v" + mani_skill.__version__
+        if subprocess.run(f"git clone -q --depth 1 --branch {tag} https://github.com/haosulab/ManiSkill {MANISKILL_SRC}",
+                          shell=True).returncode != 0:
+            print(f"no tag {tag}; using ManiSkill main")
+            sh(f"git clone -q --depth 1 https://github.com/haosulab/ManiSkill {MANISKILL_SRC}")
+    _patch_dp_baseline(code)
+    try:
+        import diffusion_policy  # noqa: F401
+    except ImportError:
+        sh(f"pip install -q --no-deps -e {code}")
+        sh('pip install -q tyro tensorboard h5py')
+        import importlib
+        importlib.invalidate_caches()
+    return code
+
+
 def _dp_baseline():
     """The patched baseline's modules (make_env, evaluate, train_rgbd), reloaded so a patch made after a first
     import takes effect."""
     import importlib
-    code = f"{MANISKILL_SRC}/examples/baselines/diffusion_policy"
-    _patch_dp_baseline(code)
+    code = _dp_code()
     if code not in sys.path:
         sys.path.insert(0, code)
     import diffusion_policy.evaluate
