@@ -147,3 +147,34 @@ GAE replaced by Grad-CAM (CNN encoder); G uses the sensor camera's own segmentat
 `tests/test_dp.py` (random Agent, fake env, CPU): the written-out DDPM update equals diffusers' step exactly,
 conditioning equals `Agent.encode_obs`, EIG completeness error 0.3%, bins sum to EIG, full removal = no-vision
 image, all stages run.
+
+## Iteration 6 — the study on the Diffusion Policy (Oct 30, 2026)
+
+`notebooks/dp_xai.ipynb`, defaults (A 20 episodes, B 40 moments, C 30, D 16 episodes x 7 conditions at 5%, E 10
+moments, F 8 episodes). **PickCube** (complete):
+* **A:** 19/20.
+* **C (late denoising replicates, more sharply than RDT):** EIG share over 5 bins of 20 DDPM steps (noisy -> clean)
+  0.00 / 0.01 / 0.03 / 0.09 / 0.87; plan change with vision removed in one bin 0.01 / 0.01 / 0.01 / 0.03 / 0.79;
+  recovered with vision in that bin only 0.05 / 0.13 / 0.06 / 0.09 / 0.85. PushCube (C done): every moment
+  0 / 0 / 0 / 0 / 1.0.
+* **D (causal, floor effect at 5%):** none 13/16, random 11/16, eig bottom_abs 12/16; eig top_abs, eig top, Grad-CAM
+  top, BlurIG top all 0/16. PushCube: none 9/16, random 10/16, bottom_abs 9/16 (the same episodes as none),
+  top_abs 2/16, top 2/16.
+* **B:** every method far above random (median deletion 0.74-0.93 vs 0.43), small spread among methods; mean
+  deletion rank: Gradient 3.5, EIG 3.7, IG (bg) 3.8, BlurIG 4.8, Grad-CAM 5.1, IG (zero) 5.5, Occlusion 5.5,
+  Grad x Input 6.0, ISS 7.6, random 9.4.
+* **G:** removing the arm 0.57 (control 0.04), cube 0.35 (0.01), gripper 0.25 (0.01): the arm matters most
+  (cf. visual embodiment dependence, arXiv 2609.16815). Claim vs effect Spearman (3 groups, coarse): EIG / BlurIG
+  0.46, IG (bg) 0.45, Grad x Input 0.39, IG (zero) 0.34; Gradient 0.03, Occlusion 0.00, ISS 0.03, Grad-CAM -0.05.
+  Gradient ranks first on B but last on G.
+* **E (EIG fails here):** map correlation with the trained model's after randomizing everything incl. the encoder:
+  Grad-CAM 0.34, IG (zero) 0.36, BlurIG 0.38, Occlusion 0.41, Gradient 0.47, Grad x Input 0.67, IG (bg) 0.68,
+  EIG 0.71, ISS 0.80. U-Net-only levels change little for any method (pixel maps pass through the intact
+  max-pooled encoder). Likely reason for EIG / IG (bg) / Grad x Input: their (x - mean frame) factor, which marks
+  whatever moved (arm, cube) whatever the model. RDT's E randomized only RDT blocks on SigLIP embeddings, so the
+  two E results are not comparable until SigLIP is randomized too.
+* **F:** vision 0.21, proprioception 0.79 (RDT 0.24-0.33 vision).
+
+**Open (from this):** (1) is "late" specific to vision? knock proprioception out per bin as a control; (2) G may
+inherit the (x - baseline) confound: score G with the randomized model's maps as a floor; (3) D at 1-2% to separate
+methods; (4) SigLIP randomization for RDT's E.
