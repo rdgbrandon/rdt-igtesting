@@ -56,6 +56,7 @@ def vulkan():
                 f.write(s)
 
 
+import re
 import shutil
 import threading
 import time
@@ -209,15 +210,26 @@ DP_SETTINGS = {"PickCube-v1": (100, 30000), "PushCube-v1": (100, 30000), "StackC
 DEMOS = os.path.expanduser("~/.maniskill/demos")
 
 
-def _stream(cmd, cwd=None):
-    """Run a command, printing its output as it comes; raise with the tail if it fails."""
+_PROGRESS = re.compile(r"\d+%\||[\d.]+(it|s|step)/(s|it)\]")
+
+
+def _stream(cmd, cwd=None, every=30):
+    """Run a command, printing its output as it comes, except progress-bar redraws (at most one every `every`
+    seconds). Every tqdm redraw is a line here, and a flood of them lags the browser, which then slows the
+    command itself through the pipe (a 2-minute demo conversion crawled for over an hour). Raises with the
+    tail of the output if the command fails."""
     p = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         bufsize=1)
-    tail = []
+                         bufsize=1, errors="replace")
+    tail, last = [], 0.0
     for line in p.stdout:
         tail = (tail + [line])[-40:]
-        if "warn" not in line.lower():
-            print(line.rstrip(), flush=True)
+        if "warn" in line.lower() or not line.strip():
+            continue
+        if _PROGRESS.search(line):
+            if time.time() - last < every:
+                continue
+            last = time.time()
+        print(line.rstrip(), flush=True)
     if p.wait() != 0:
         raise RuntimeError(f"failed (exit {p.returncode}): {cmd}\n" + "".join(tail))
 
